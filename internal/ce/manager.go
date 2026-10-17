@@ -523,7 +523,8 @@ func (m *Manager) dialRegistrar(ctx context.Context, cmd int) (*client.HTCondorC
 	return cl, nil
 }
 
-// installToken writes the token to the token file atomically (mode 0600) and
+// installToken writes the token to the token file atomically (mode 0600,
+// owned by root under a root master) and
 // records it in the state, with a renewal time drawn for it and a new
 // generation the local master must be reconfigured for. It does not touch any
 // other file in tokens.d, except the copy it installed in a previous token
@@ -544,7 +545,8 @@ func (m *Manager) installToken(raw string) error {
 	if err := os.MkdirAll(filepath.Dir(tokenFile), 0o700); err != nil {
 		return fmt.Errorf("token directory: %w", err)
 	}
-	if err := atomicfile.WriteFile(tokenFile, []byte(strings.TrimSpace(raw)+"\n"), 0o600); err != nil {
+	// HTCondor reads the token as root and refuses it unless root owns it.
+	if err := atomicfile.WriteRootOwned(tokenFile, []byte(strings.TrimSpace(raw)+"\n"), 0o600); err != nil {
 		return fmt.Errorf("installing token: %w", err)
 	}
 	renewAt := m.renewAt(claims.IssuedAt, claims.Expiry)
