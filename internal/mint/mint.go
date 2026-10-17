@@ -12,8 +12,11 @@
 //
 // The key is read through droppriv.OpenAsRoot: credentials are always read as
 // root, since the daemon has dropped to the condor account and the key is
-// root-owned 0600. CreateKeyIfMissing creates that file, in the format
-// HTCondor writes, when it does not exist.
+// root-owned 0600. As HTCondor's read_secure_file(SECURE_FILE_VERIFY_ALL)
+// does, the file must be owned by the process's real uid (root when started
+// by a root master) and not be accessible to group or others.
+// CreateKeyIfMissing creates that file, in the format HTCondor writes, when
+// it does not exist.
 package mint
 
 import (
@@ -52,8 +55,12 @@ type Token struct {
 type Minter struct {
 	// KeyDir is SEC_PASSWORD_DIRECTORY.
 	KeyDir string
+	// PoolKeyFile is SEC_TOKEN_POOL_SIGNING_KEY_FILE, the file of the POOL
+	// key, which HTCondor reads from there rather than from KeyDir.
+	PoolKeyFile string
 	// KeyID is the signing key's file name in KeyDir and the token's kid
-	// (HTC_REGISTRATIOND_SIGNING_KEY, default "ce-registration").
+	// (HTC_REGISTRATIOND_SIGNING_KEY, default "ce-registration"); for "POOL"
+	// the file is PoolKeyFile.
 	KeyID string
 	// Issuer is the iss claim (TRUST_DOMAIN).
 	Issuer string
@@ -67,7 +74,8 @@ type Minter struct {
 	Lifetime time.Duration
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
-	// ReadKey reads the scrambled key file; nil means droppriv.OpenAsRoot.
+	// ReadKey reads the scrambled key file; nil means readSecure (as root,
+	// with HTCondor's owner and mode checks).
 	ReadKey func(path string) ([]byte, error)
 }
 
@@ -86,12 +94,17 @@ func (m *Minter) Check() error {
 	return err
 }
 
-func readAsRoot(path string) ([]byte, error) {
+// readSecure reads a key file as root, refusing it unless it passes
+// HTCondor's read_secure_file checks.
+func readSecure(path string) ([]byte, error) {
 	f, err := droppriv.OpenAsRoot(path)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = f.Close() }()
+	if err := checkSecure(f); err != nil {
+		return nil, err
+	}
 	return io.ReadAll(f)
 }
 
@@ -102,7 +115,7 @@ func (m *Minter) signingKey() ([]byte, error) {
 	}
 	read := m.ReadKey
 	if read == nil {
-		read = readAsRoot
+		read = readSecure
 	}
 	scrambled, err := read(path)
 	if err != nil {
@@ -113,7 +126,7 @@ func (m *Minter) signingKey() ([]byte, error) {
 	}
 	key := scramble(scrambled)
 	// HTCondor doubles the POOL key before HKDF; named keys are used as-is.
-	if m.KeyID == "POOL" {
+	if m.KeyID == PoolKeyID {
 		key = append(key, key...)
 	}
 	return key, nil
