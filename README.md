@@ -19,15 +19,23 @@ A CE proves its name in one of two ways:
 - **Callback**: the CE sends `REG_REQUEST` with its own sinful and a nonce. The
   registrar calls back over CEDAR, verifies the CE's *server* certificate
   against the requested name, checks the nonce, and delivers the token on the
-  callback connection only. Renewal is a fresh exchange at half the token
-  lifetime.
+  callback connection only. Renewal is a fresh exchange 40-60% of the way
+  through the token's lifetime (drawn per token).
 - **Approval**: the CE publishes an approval URL with a user code
   (`XXXX-XXXX`). An administrator opens the URL on the registrar's web UI,
-  logs in with OIDC and approves it (or runs `htc-registration approve CODE`
-  on the registrar), and the CE collects the token by polling.
-  Renewal uses a refresh secret with two-phase rotation (current / pending /
-  retired) that survives a crash at any point. A superseded secret that shows
-  up again revokes the registration.
+  logs in with OIDC and approves it (or runs
+  `htc-registration approve CODE NAME` on the registrar), and the CE collects
+  the token by polling. The token is an access token: renewal uses a refresh
+  secret, which outlives it. A CE whose token expired (it was down, or the
+  registrar was unreachable) renews with the secret; only a revoked
+  registration, a refresh secret idle for `REFRESH_IDLE_LIFETIME`, a
+  registration older than `MAX_REGISTRATION_AGE`, or an approver who is no
+  longer authorized needs a person. The secret rotates in two phases
+  (current / pending) and survives a crash at any point. A superseded secret
+  that shows up again (retired, or a pending secret replaced by a renewal with
+  the current one) revokes the registration, as do more than `MAX_REISSUES`
+  renewals in a row with the current secret: both mean a copy of the CE's
+  state is in use.
 
 `auto` (the default) tries callback when an SSL server credential is available,
 and falls back to approval.
@@ -75,7 +83,7 @@ servers on loopback, using a generated test CA.
 | `REG_STATUS` | 77004 | CE | READ |
 | `REG_RENEW_NOW` | 77005 | CE | ADMINISTRATOR |
 | `REG_REQUEST_APPROVAL` | 77006 | CE | ADMINISTRATOR |
-| `REG_ADMIN_LIST` / `APPROVE` / `DENY` / `REVOKE` | 77010-77013 | registrar | ADMINISTRATOR |
+| `REG_ADMIN_LIST` / `APPROVE` / `DENY` / `REVOKE` | 77010-77013 | registrar | ADMINISTRATOR + encryption |
 
 ## Configuration
 
@@ -91,8 +99,11 @@ Both modes:
 
 CE:
 
-- `NAME`: default `$(SCHEDD_NAME)`, then `$(FULL_HOSTNAME)`. Must equal the
-  Scheduler ad's `Name`.
+- `NAME`: default: the name the schedd advertises, which is
+  `$(FULL_HOSTNAME)`, or `SCHEDD_NAME` made a daemon name as the schedd makes
+  it (a name that is not this host's becomes `name@$(FULL_HOSTNAME)`, which no
+  token can match). Must equal the Scheduler ad's `Name`. Names are
+  lower-cased; the registrar compares them without regard to case.
 - `METHOD`: `auto` | `callback` | `approval` (default `auto`).
 - `REGISTRAR`: the registrar's address. Default: the host:port of the first
   `CONDOR_VIEW_HOST` entry (`COLLECTOR_PORT` when it names no port) with
@@ -103,15 +114,26 @@ CE:
 - `REGISTRAR_NAME`: the name its certificate must carry. By default this is
   derived from the address.
 - `CALLBACK_ADDRESS`: default: the daemon's shared-port sinful.
-- `TOKEN_FILE`: default `$(SEC_TOKEN_SYSTEM_DIRECTORY)/50-htc-registration`.
+- `TOKEN_FILE`: default `50-htc-registration` in `SEC_TOKEN_DIRECTORY` when
+  that is set, else in `SEC_TOKEN_SYSTEM_DIRECTORY`: the directory the CE's
+  daemons read tokens from.
   The daemon runs as condor and writes the file itself, so the directory must
   be writable by condor. On an HTCondor-CE it is `/etc/condor-ce/tokens.d`,
   which the CE package creates owned by condor, mode 0700.
+- `CONNECT_TIMEOUT` / `CALLBACK_WAIT`: default 30 s / 90 s: connecting to
+  the registrar, and waiting for its callback.
+
+`condor_reconfig` re-reads `METHOD`, `REGISTRAR`, `REGISTRAR_NAME`,
+`CALLBACK_ADDRESS`, the token directory, the timeouts, `CONDOR_VIEW_HOST` and
+the `AUTH_SSL_*` CA knobs. A changed token directory gets a token at once.
 
 Registrar:
 
 - `SIGNING_KEY`: default `ce-registration`, the name of the signing key file
-  in `SEC_PASSWORD_DIRECTORY`. When the file does not exist, the registrar
+  in `SEC_PASSWORD_DIRECTORY` (`POOL` means the pool key, read from
+  `SEC_TOKEN_POOL_SIGNING_KEY_FILE` as HTCondor reads it). As HTCondor
+  requires, the file must be owned by the daemon's real uid (root under a
+  root master) and not be readable by group or others. When the file does not exist, the registrar
   creates it at startup and on every reconfig, as an HTCondor collector
   creates its own signing key: 64 random bytes, root-owned, mode 0600, in
   HTCondor's format. An existing file is never replaced. The collector on the
@@ -120,18 +142,26 @@ Registrar:
   (root-owned, mode 0600) and set the same `TRUST_DOMAIN` on both, so a token
   works on either. If a registrar there already created its own key, replace
   that file with the copy.
-- `IDENTITY_DOMAIN`: default `$(UID_DOMAIN)`. The issuer is `TRUST_DOMAIN`.
+- `IDENTITY_DOMAIN`: default `$(UID_DOMAIN)`. The issuer is `TRUST_DOMAIN`
+  (HTCondor's default, `$(UID_DOMAIN)`, applies when it is unset); the
+  registrar does not start if it is empty.
 - `TOKEN_LIMITS`: default `ADVERTISE_SCHEDD`.
 - `TOKEN_LIFETIME`: default 72 h.
 - `CALLBACK_NAMES`: `authz` | `any` (default `authz`: the name must be known
   to an `AUTHZ` backend; with no backend every callback is refused).
 - `CALLBACK_ALLOW_NETWORKS`: CIDRs re-allowed for callbacks. Loopback, RFC
-  1918, CGNAT, link-local, multicast, ULA, their IPv4-mapped / NAT64 / 6to4
-  forms, and the registrar's own addresses are denied by default. The check
+  1918, CGNAT, link-local, multicast, ULA, the documentation, benchmarking
+  and IETF special-purpose ranges, the Azure WireServer address, their
+  IPv4-mapped / SIIT / NAT64 / 6to4 forms, and the registrar's own addresses
+  are denied by default. The check
   runs at connect time on each address the callback actually dials, after
   the CE's host name is resolved.
-- `CALLBACK_CONNECT_TIMEOUT` / `CALLBACK_TIMEOUT`: default 10 s / 30 s.
-- `MAX_PENDING_PER_IP` / `MAX_PENDING`: default 10 / 1000.
+- `CALLBACK_CONNECT_TIMEOUT` / `CALLBACK_TIMEOUT`: default 10 s / 30 s. A
+  failed callback backs off further callbacks for that name from that
+  network (an IPv6 /64 or an IPv4 address) only; a success clears the
+  name's back-off. A requester learns that a callback failed, never how.
+- `MAX_PENDING_PER_IP` / `MAX_PENDING`: default 10 / 1000: live requests per
+  network (an IPv6 /64, an IPv4 address) and in total.
 - `APPROVAL_TTL` (30 min), `UNCLAIMED_TTL` (24 h), `POLL_INTERVAL` (5 s).
 - `VERIFICATION_URI`: default `$(HTC_REGISTRATIOND_PUBLIC_URL)/approve` when
   the web UI is configured, else `https://$(FULL_HOSTNAME)/approve`. A CE is
@@ -141,6 +171,15 @@ Registrar:
   name (an administrator, or allowed by an `AUTHZ` backend). Approvals made
   with `htc-registration approve` (CEDAR `ADMINISTRATOR`) are not re-checked.
 - `MAX_REGISTRATION_AGE` (no cap).
+- `REFRESH_IDLE_LIFETIME` (30 days): a refresh secret not used for this long
+  no longer renews.
+- `MAX_REISSUES` (5): renewals in a row with the current refresh secret (the
+  pending one never proven) before the registration is revoked. An honest CE
+  does this only when it loses the reply to every one of them.
+
+`condor_reconfig` re-reads every registrar knob above except `SIGNING_KEY`,
+`IDENTITY_DOMAIN`, `TOKEN_LIMITS`, `TOKEN_LIFETIME`, `CALLBACK_NAMES` and
+`CALLBACK_ALLOW_NETWORKS`, which take a restart.
 
 Certificate trust uses the standard HTCondor knobs: `AUTH_SSL_CLIENT_CAFILE`,
 `AUTH_SSL_CLIENT_CADIR` and `AUTH_SSL_CLIENT_USE_DEFAULT_CAS` (default true:
@@ -254,3 +293,10 @@ listed without a `CILogonID` can never approve.
 
 On a CE, `htc-registration request --approval` starts an approval request now,
 even when the CE is configured for callback, and prints the URL and code.
+
+On the registrar, `htc-registration approve CODE NAME` approves a request
+only if it is for `NAME` (compared without regard to case), so a code passed
+along with the wrong name is refused and the refusal shows the request's
+name. A name that already has an active registration is refused unless
+`--replace` is given, which also revokes the name's approval-mode
+registrations.
