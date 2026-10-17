@@ -1,0 +1,179 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Hand-built subset of https://topology.opensciencegrid.org/rgsummary/xml for the topology backend tests -->
+<ResourceSummary>
+  <ResourceGroup>
+    <GroupName>Example-Site</GroupName>
+    <Resources>
+      <!-- Active CE; the user is the primary administrative contact -->
+      <Resource>
+        <Name>EXAMPLE-CE1</Name>
+        <Active>True</Active>
+        <FQDN>ce1.example.edu</FQDN>
+        <Services>
+          <Service><ID>1</ID><Name>CE</Name><Description>Compute Element</Description></Service>
+        </Services>
+        <ContactLists>
+          <ContactList>
+            <ContactType>Administrative Contact</ContactType>
+            <Contacts>
+              <Contact><Name>Primary Admin</Name><CILogonID>http://cilogon.org/serverA/users/111</CILogonID><ContactRank>Primary</ContactRank></Contact>
+            </Contacts>
+          </ContactList>
+        </ContactLists>
+      </Resource>
+      <!-- Active CE; the user is only the secondary administrative contact -->
+      <Resource>
+        <Name>EXAMPLE-CE2</Name>
+        <Active>True</Active>
+        <FQDN>ce2.example.edu</FQDN>
+        <Services>
+          <Service><ID>157</ID><Name>Execution Endpoint</Name></Service>
+          <Service><ID>1</ID><Name>CE</Name></Service>
+        </Services>
+        <ContactLists>
+          <ContactList>
+            <ContactType>Security Contact</ContactType>
+            <Contacts>
+              <Contact><Name>Security Person</Name><CILogonID>http://cilogon.org/serverA/users/333</CILogonID><ContactRank>Primary</ContactRank></Contact>
+            </Contacts>
+          </ContactList>
+          <ContactList>
+            <ContactType>Administrative Contact</ContactType>
+            <Contacts>
+              <Contact><Name>Someone Else</Name><CILogonID>http://cilogon.org/serverA/users/222</CILogonID><ContactRank>Primary</ContactRank></Contact>
+              <Contact><Name>Primary Admin</Name><CILogonID>http://cilogon.org/serverA/users/111</CILogonID><ContactRank>Secondary</ContactRank></Contact>
+            </Contacts>
+          </ContactList>
+        </ContactLists>
+      </Resource>
+      <!-- Active CE; the user is the tertiary administrative contact -->
+      <Resource>
+        <Name>EXAMPLE-CE3</Name>
+        <Active>True</Active>
+        <FQDN>ce3.example.edu</FQDN>
+        <Services>
+          <Service><ID>1</ID><Name>CE</Name></Service>
+        </Services>
+        <ContactLists>
+          <ContactList>
+            <ContactType>Administrative Contact</ContactType>
+            <Contacts>
+              <Contact><Name>Someone Else</Name><CILogonID>http://cilogon.org/serverA/users/222</CILogonID><ContactRank>Primary</ContactRank></Contact>
+              <Contact><Name>No CILogon</Name><ContactRank>Secondary</ContactRank></Contact>
+              <Contact><Name>Primary Admin</Name><CILogonID>http://cilogon.org/serverA/users/111</CILogonID><ContactRank>Tertiary</ContactRank></Contact>
+            </Contacts>
+          </ContactList>
+        </ContactLists>
+      </Resource>
+      <!-- Inactive CE administered by the user -->
+      <Resource>
+        <Name>EXAMPLE-RETIRED-CE</Name>
+        <Active>False</Active>
+        <FQDN>retired-ce.example.edu</FQDN>
+        <Services>
+          <Service><ID>1</ID><Name>CE</Name></Service>
+        </Services>
+        <ContactLists>
+          <ContactList>
+            <ContactType>Administrative Contact</ContactType>
+            <Contacts>
+              <Contact><Name>Primary Admin</Name><CILogonID>http://cilogon.org/serverA/users/111</CILogonID><ContactRank>Primary</ContactRank></Contact>
+            </Contacts>
+          </ContactList>
+        </ContactLists>
+      </Resource>
+      <!-- Active non-CE resource administered by the user -->
+      <Resource>
+        <Name>EXAMPLE-SQUID</Name>
+        <Active>True</Active>
+        <FQDN>squid.example.edu</FQDN>
+        <Services>
+          <Service><ID>138</ID><Name>Squid</Name></Service>
+        </Services>
+        <ContactLists>
+          <ContactList>
+            <ContactType>Administrative Contact</ContactType>
+            <Contacts>
+              <Contact><Name>Primary Admin</Name><CILogonID>http://cilogon.org/serverA/users/111</CILogonID><ContactRank>Primary</ContactRank></Contact>
+            </Contacts>
+          </ContactList>
+        </ContactLists>
+      </Resource>
+      <!-- Malformed resource without an FQDN -->
+      <Resource>
+        <Name>EXAMPLE-NO-FQDN</Name>
+        <Active>True</Active>
+        <Services>
+          <Service><ID>1</ID><Name>CE</Name></Service>
+        </Services>
+        <ContactLists>
+          <ContactList>
+            <ContactType>Administrative Contact</ContactType>
+            <Contacts>
+              <Contact><Name>Primary Admin</Name><CILogonID>http://cilogon.org/serverA/users/111</CILogonID><ContactRank>Primary</ContactRank></Contact>
+            </Contacts>
+          </ContactList>
+        </ContactLists>
+      </Resource>
+      <!-- Active CE where the user is only a security contact -->
+      <Resource>
+        <Name>EXAMPLE-CE4</Name>
+        <Active>True</Active>
+        <FQDN>ce4.example.edu</FQDN>
+        <Services>
+          <Service><ID>1</ID><Name>CE</Name></Service>
+        </Services>
+        <ContactLists>
+          <ContactList>
+            <ContactType>Security Contact</ContactType>
+            <Contacts>
+              <Contact><Name>Primary Admin</Name><CILogonID>http://cilogon.org/serverA/users/111</CILogonID><ContactRank>Primary</ContactRank></Contact>
+            </Contacts>
+          </ContactList>
+        </ContactLists>
+      </Resource>
+      <!-- Active CE whose FQDN is written in mixed case; one administrative
+           contact has an empty CILogonID -->
+      <Resource>
+        <Name>EXAMPLE-CE5</Name>
+        <Active>true</Active>
+        <FQDN>CE5.Example.EDU</FQDN>
+        <Services>
+          <Service><ID>1</ID><Name>CE</Name></Service>
+        </Services>
+        <ContactLists>
+          <ContactList>
+            <ContactType>Administrative Contact</ContactType>
+            <Contacts>
+              <Contact><Name>Empty ID</Name><CILogonID></CILogonID><ContactRank>Primary</ContactRank></Contact>
+              <Contact><Name>Blank ID</Name><CILogonID>   </CILogonID><ContactRank>Secondary</ContactRank></Contact>
+              <Contact><Name>Fifth Admin</Name><CILogonID>http://cilogon.org/serverA/users/555</CILogonID><ContactRank>Tertiary</ContactRank></Contact>
+            </Contacts>
+          </ContactList>
+        </ContactLists>
+      </Resource>
+    </Resources>
+  </ResourceGroup>
+  <ResourceGroup>
+    <GroupName>Other-Site</GroupName>
+    <Resources>
+      <!-- A CE identified by service name only -->
+      <Resource>
+        <Name>OTHER-CE</Name>
+        <Active>True</Active>
+        <FQDN>ce.other.org</FQDN>
+        <Services>
+          <Service><ID>999</ID><Name>CE</Name></Service>
+        </Services>
+        <ContactLists>
+          <ContactList>
+            <ContactType>Administrative Contact</ContactType>
+            <Contacts>
+              <Contact><Name>Other Admin</Name><CILogonID>http://cilogon.org/serverE/users/777</CILogonID><ContactRank>Primary</ContactRank></Contact>
+            </Contacts>
+          </ContactList>
+        </ContactLists>
+      </Resource>
+    </Resources>
+  </ResourceGroup>
+</ResourceSummary>
