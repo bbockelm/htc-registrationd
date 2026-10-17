@@ -86,3 +86,46 @@ func assertNoTemps(t *testing.T, dir string) {
 		}
 	}
 }
+
+// A failed directory fsync after the rename is not a failure: the new file is
+// in place, and reporting an error would leave the caller's memory and the
+// file disagreeing.
+func TestDirSyncFailureAfterRename(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	orig := syncDir
+	syncDir = func(string) error { return errors.New("injected fsync failure") }
+	t.Cleanup(func() { syncDir = orig })
+	if err := WriteFile(path, []byte("new"), 0o600); err != nil {
+		t.Fatalf("WriteFile reported %v after the rename succeeded", err)
+	}
+	if b, _ := os.ReadFile(path); string(b) != "new" { //nolint:gosec // test temp file
+		t.Fatalf("contents %q", b)
+	}
+}
+
+// RemoveTemps removes a crash's leftover temporary files of one target and
+// nothing else.
+func TestRemoveTemps(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "50-htc-registration")
+	keep := []string{"50-htc-registration", "other-token", ".other-token.tmp-123", "50-htc-registration.tmp-1"}
+	gone := []string{".50-htc-registration.tmp-123", ".50-htc-registration.tmp-abc"}
+	for _, n := range append(append([]string(nil), keep...), gone...) {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := RemoveTemps(path); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range keep {
+		if _, err := os.Stat(filepath.Join(dir, n)); err != nil {
+			t.Errorf("%s was removed", n)
+		}
+	}
+	for _, n := range gone {
+		if _, err := os.Stat(filepath.Join(dir, n)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s was kept", n)
+		}
+	}
+}
