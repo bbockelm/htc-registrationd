@@ -91,8 +91,10 @@ jobs:
 
     # A CE-Collector (htcondor-ce-collector) running the registrar and a CE
     # (htcondor-ce), from the HTCondor 25.x repository, each under a
-    # condor_master started as root. See the checks in the script.
-    - name: Registrar and CE under condor_master
+    # condor_master started as root, and a pilot factory that exchanges a
+    # SciToken at the registered CE and runs a job there. See the checks in
+    # the script.
+    - name: Registrar, CE and factory under condor_master
       run: test/root/run.sh
       env:
         KEEP: '1'
