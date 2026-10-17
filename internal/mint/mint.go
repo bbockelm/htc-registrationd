@@ -12,7 +12,8 @@
 //
 // The key is read through droppriv.OpenAsRoot: credentials are always read as
 // root, since the daemon has dropped to the condor account and the key is
-// root-owned 0600.
+// root-owned 0600. CreateKeyIfMissing creates that file, in the format
+// HTCondor writes, when it does not exist.
 package mint
 
 import (
@@ -24,7 +25,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -96,14 +96,14 @@ func readAsRoot(path string) ([]byte, error) {
 }
 
 func (m *Minter) signingKey() ([]byte, error) {
-	if m.KeyID == "" || strings.ContainsAny(m.KeyID, `/\`) || strings.Contains(m.KeyID, "..") {
-		return nil, fmt.Errorf("mint: invalid signing key name %q", m.KeyID)
+	path, err := m.KeyFile()
+	if err != nil {
+		return nil, err
 	}
 	read := m.ReadKey
 	if read == nil {
 		read = readAsRoot
 	}
-	path := filepath.Join(m.KeyDir, m.KeyID)
 	scrambled, err := read(path)
 	if err != nil {
 		return nil, fmt.Errorf("mint: reading signing key %s: %w", path, err)
@@ -111,11 +111,7 @@ func (m *Minter) signingKey() ([]byte, error) {
 	if len(scrambled) == 0 {
 		return nil, fmt.Errorf("mint: signing key %s is empty", path)
 	}
-	deadbeef := []byte{0xde, 0xad, 0xbe, 0xef}
-	key := make([]byte, len(scrambled))
-	for i := range scrambled {
-		key[i] = scrambled[i] ^ deadbeef[i%len(deadbeef)]
-	}
+	key := scramble(scrambled)
 	// HTCondor doubles the POOL key before HKDF; named keys are used as-is.
 	if m.KeyID == "POOL" {
 		key = append(key, key...)
