@@ -191,7 +191,8 @@ Pages: `/approve` (enter a code, or `/approve?code=XXXX-XXXX`: the request's
 CE name, code, source address and its reverse DNS, time and CE version, and
 whether the logged-in user may approve it and why), `/registrations` (the
 registrations the user approved or is authorized for, all of them for an
-administrator, with revoke), `/healthz`. Login and approve requests are
+administrator; revoking one takes current authorization for its name, or
+being an administrator), `/healthz`. Login and approve requests are
 rate-limited per client address (per /64 for IPv6).
 
 ### Authorization backends (registrar)

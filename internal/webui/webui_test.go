@@ -709,6 +709,25 @@ func TestRegistrationsAndRevoke(t *testing.T) {
 	if r, _ := h.store.Registration(context.Background(), other); r.Status != registrar.RegActive {
 		t.Fatal("revoked the wrong registration")
 	}
+
+	// alice loses her map file line: she still sees what she approved, but
+	// may no longer revoke it.
+	if err := os.WriteFile(h.mapf, []byte("OIDC someone-else "+testCE+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.mf.Reload(""); err != nil {
+		t.Fatal(err)
+	}
+	body, _ = h.get(c, "/registrations")
+	if !strings.Contains(body, testCE) || strings.Contains(body, `value="`+byAlice+`"`) {
+		t.Fatalf("former approver's view:\n%s", body)
+	}
+	if _, code := h.post(c, "/registrations/revoke", url.Values{"csrf": {csrfFrom(t, body)}, "id": {byAlice}}, nil); code != http.StatusForbidden {
+		t.Fatalf("former approver revoked: %d", code)
+	}
+	if r, _ := h.store.Registration(context.Background(), byAlice); r.Status != registrar.RegActive {
+		t.Fatal("a former approver revoked a registration")
+	}
 }
 
 func TestSecurityHeaders(t *testing.T) {

@@ -469,15 +469,23 @@ type regRow struct {
 	CanRevoke bool
 }
 
-// visible reports whether sess may see (and so revoke) reg: administrators
-// see every registration, others the ones they approved or are authorized
-// for.
-func (s *Server) visible(ctx context.Context, sess *session, admin bool, reg *registrar.RegistrationRecord) bool {
-	if admin || reg.Approver == approver(sess).String() {
-		return true
+// access is what a user may do with one registration.
+type access struct {
+	see, revoke bool
+	// err is set when authorization could not be checked.
+	err error
+}
+
+// accessTo reports what sess may do with reg: administrators see and
+// revoke every registration; others revoke the ones they are authorized
+// for now, and also see the ones they approved.
+func (s *Server) accessTo(ctx context.Context, sess *session, admin bool, reg *registrar.RegistrationRecord) access {
+	if admin {
+		return access{see: true, revoke: true}
 	}
 	d, err := s.cfg.Authz.Decide(ctx, sess.Principal, reg.Name)
-	return err == nil && d.Allowed
+	authorized := err == nil && d.Allowed
+	return access{see: authorized || reg.Approver == approver(sess).String(), revoke: authorized, err: err}
 }
 
 func approverText(a string) string {
@@ -508,15 +516,16 @@ func (s *Server) handleRegistrations(w http.ResponseWriter, r *http.Request) {
 	admin := s.cfg.Authz.IsAdmin(sess.Principal)
 	page := registrationsPage{base: s.base(r, "Registrations")}
 	for _, reg := range regs {
-		if !s.visible(r.Context(), sess, admin, reg) {
+		acc := s.accessTo(r.Context(), sess, admin, reg)
+		if !acc.see {
 			continue
 		}
 		page.Rows = append(page.Rows, regRow{Reg: reg, Approver: approverText(reg.Approver),
-			CanRevoke: reg.Status != registrar.RegRevoked})
+			CanRevoke: acc.revoke && reg.Status != registrar.RegRevoked})
 	}
 	if id := r.URL.Query().Get("revoked"); id != "" {
 		if reg, err := s.cfg.Store.Registration(r.Context(), id); err == nil && reg.Status == registrar.RegRevoked &&
-			s.visible(r.Context(), sess, admin, reg) {
+			s.accessTo(r.Context(), sess, admin, reg).see {
 			page.Revoked = reg
 		}
 	}
@@ -531,8 +540,24 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	id := r.PostFormValue("id")
 	reg, err := s.cfg.Store.Registration(r.Context(), id)
 	admin := s.cfg.Authz.IsAdmin(sess.Principal)
-	if err != nil || !s.visible(r.Context(), sess, admin, reg) {
+	var acc access
+	if err == nil {
+		acc = s.accessTo(r.Context(), sess, admin, reg)
+	}
+	if !acc.see {
 		s.message(w, r, http.StatusNotFound, "Unknown registration", "No registration you can manage has that id.")
+		return
+	}
+	if acc.err != nil {
+		s.log.Error("webui: authorization check failed", "principal", sess.Principal, "name", reg.Name, "err", acc.err)
+		s.message(w, r, http.StatusServiceUnavailable, "Authorization unavailable",
+			"Your authorization for "+reg.Name+" could not be checked. Nothing was changed. Try again later.")
+		return
+	}
+	if !acc.revoke {
+		s.log.Warn("webui: unauthorized revocation refused", "principal", sess.Principal, "registration", reg.ID,
+			"name", reg.Name, "client", s.clientIP(r))
+		s.message(w, r, http.StatusForbidden, "Not authorized", "You are not authorized to revoke the registration of "+reg.Name+".")
 		return
 	}
 	who := approver(sess)
