@@ -167,8 +167,9 @@ an administrator of the registrar, or open it yourself if you are allowed to
 approve this CE. The code expires after 30 minutes; the CE then starts a new
 request with a new code.
 
-Once the token is installed, the daemon reconfigures the CE and checks the
-token against `CONDOR_VIEW_HOST`. `htc-registration status` shows the result
+Once the token is installed (in `/etc/condor-ce/tokens.d`, owned by root
+with mode 0600, as HTCondor requires), the daemon reconfigures the CE and
+checks the token against `CONDOR_VIEW_HOST`. `htc-registration status` shows the result
 as `View host check`.
 
 The CE's name is the name its schedd advertises: `SCHEDD_NAME` if set, else
@@ -212,11 +213,11 @@ Then add the authorization settings below to a file of your own, such as
 HTC_REGISTRATIOND_AUTHZ         = mapfile
 HTC_REGISTRATIOND_AUTHZ_MAPFILE = /etc/condor-ce/htc-registrationd.map
 
-# The web UI, for approval mode
-HTC_REGISTRATIOND_HTTPS_ADDR     = :443
+# The web UI, for approval mode, on the collector's port 9619
+SHARED_PORT_HTTP_FORWARDING_ID   = htc_registrationd
 HTC_REGISTRATIOND_HTTPS_CERTFILE = /etc/grid-security/hostcert.pem
 HTC_REGISTRATIOND_HTTPS_KEYFILE  = /etc/grid-security/hostkey.pem
-HTC_REGISTRATIOND_PUBLIC_URL     = https://collector.example.org
+HTC_REGISTRATIOND_PUBLIC_URL     = https://collector.example.org:9619
 HTC_REGISTRATIOND_OIDC_ISSUER    = https://cilogon.org
 HTC_REGISTRATIOND_OIDC_CLIENT_ID = cilogon:/client_id/0123456789abcdef
 HTC_REGISTRATIOND_OIDC_CLIENT_SECRET_FILE = /etc/condor-ce/htc-registrationd-oidc-secret
@@ -237,7 +238,7 @@ no line is refused. Users are named by the identity provider's `sub` claim,
 without the issuer. The registrar re-reads the file when it changes. See
 [Map file format](#map-file-format) for patterns.
 
-Register `https://collector.example.org/oidc/callback` (your `PUBLIC_URL`
+Register `https://collector.example.org:9619/oidc/callback` (your `PUBLIC_URL`
 followed by `/oidc/callback`) as the redirect URI of the OIDC client. The
 client secret file and the TLS key may be readable by root only.
 
@@ -247,10 +248,14 @@ shows it.
 
 If every CE uses callback mode, leave out the web UI settings.
 
-<!-- SHARED-PORT-WEB-UI: reconcile with the sharedport-http-root-ci branch. When the registrar can serve its web UI through the collector's shared port, add: "The web UI is served on the collector's shared port (e.g. https://collector.example.org:9619) when SHARED_PORT_HTTP_FORWARDING_ID = htc_registrationd; a separate HTC_REGISTRATIOND_HTTPS_ADDR listener is optional." -->
-The web UI needs its own listener. `HTC_REGISTRATIOND_HTTPS_ADDR` serves
-HTTPS directly. To run it behind a reverse proxy that terminates TLS, set
-`HTC_REGISTRATIOND_HTTP_ADDR = 127.0.0.1:8080` instead of the three `HTTPS_`
+The web UI is served on the collector's port 9619, so no other port needs
+to be open. This needs HTCondor 25.7.2 or later. The shared port forwards
+web traffic to only one daemon per host, so a host that also runs
+htcondor-api (`HTTP_API`) must choose one of them. To use a port of its
+own instead, set `HTC_REGISTRATIOND_HTTPS_ADDR = :443`, drop
+`SHARED_PORT_HTTP_FORWARDING_ID`, and leave the port out of `PUBLIC_URL`.
+To run it behind a reverse proxy that terminates TLS, set
+`HTC_REGISTRATIOND_HTTP_ADDR = 127.0.0.1:8080` instead of the `HTTPS_`
 settings, and point the proxy at it.
 
 ### Authorization with OSG Topology
@@ -262,10 +267,10 @@ HTC_REGISTRATIOND_OIDC_SCOPES          = openid email profile org.cilogon.userin
 HTC_REGISTRATIOND_ADMINS               = OSG1000001
 
 # The web UI, as in the map file example
-HTC_REGISTRATIOND_HTTPS_ADDR     = :443
+SHARED_PORT_HTTP_FORWARDING_ID   = htc_registrationd
 HTC_REGISTRATIOND_HTTPS_CERTFILE = /etc/grid-security/hostcert.pem
 HTC_REGISTRATIOND_HTTPS_KEYFILE  = /etc/grid-security/hostkey.pem
-HTC_REGISTRATIOND_PUBLIC_URL     = https://collector.example.org
+HTC_REGISTRATIOND_PUBLIC_URL     = https://collector.example.org:9619
 HTC_REGISTRATIOND_OIDC_ISSUER    = https://cilogon.org
 HTC_REGISTRATIOND_OIDC_CLIENT_ID = cilogon:/client_id/0123456789abcdef
 HTC_REGISTRATIOND_OIDC_CLIENT_SECRET_FILE = /etc/condor-ce/htc-registrationd-oidc-secret
@@ -352,7 +357,7 @@ DENY_ADVERTISE_SCHEDD = $(DENY_ADVERTISE_SCHEDD), ce.example.edu@users.htcondor.
 
 - **Ports.** CEs connect to the CE-Collector on 9619, as they already do.
   In callback mode, the CE-Collector host connects to each CE on 9619.
-  Approvers' browsers connect to the web UI (443 in the examples). The
+  Approvers' browsers connect to the web UI, on 9619 in the examples. The
   registrar connects out to the identity provider and, with Topology, to
   `topology.opensciencegrid.org`.
 - **Files that hold secrets.** On the CE-Collector:
@@ -434,7 +439,8 @@ CE-Collector that accepts them.
 
 | Knob | Default | Meaning |
 |---|---|---|
-| `HTC_REGISTRATIOND_HTTPS_ADDR` | none | HTTPS listener, such as `:443` |
+| `SHARED_PORT_HTTP_FORWARDING_ID` | none | `htc_registrationd` serves the web UI on the shared port (HTCondor 25.7.2+) |
+| `HTC_REGISTRATIOND_HTTPS_ADDR` | none | HTTPS listener of its own, such as `:443` |
 | `HTC_REGISTRATIOND_HTTPS_CERTFILE` | none | certificate for the HTTPS listener; re-read when it changes |
 | `HTC_REGISTRATIOND_HTTPS_KEYFILE` | none | key for the HTTPS listener; may be readable by root only |
 | `HTC_REGISTRATIOND_HTTP_ADDR` | none | plain HTTP listener on a loopback address, for a reverse proxy |
@@ -447,7 +453,8 @@ CE-Collector that accepts them.
 | `HTC_REGISTRATIOND_OIDC_PRINCIPAL_CLAIM` | `sub` | the claim that names a user; `osgid` for Topology; never `email` |
 | `HTC_REGISTRATIOND_ADMINS` | none | users who may approve any CE and manage every registration |
 
-The web UI is enabled when `HTTPS_ADDR` or `HTTP_ADDR` is set. Register
+The web UI is enabled when `PUBLIC_URL` is set and the web UI has a
+listener: the shared port, `HTTPS_ADDR` or `HTTP_ADDR`. Register
 `<PUBLIC_URL>/oidc/callback` as the client's redirect URI.
 
 ### Authorization
