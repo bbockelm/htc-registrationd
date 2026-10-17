@@ -10,7 +10,6 @@
 package ssrf
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -89,11 +88,6 @@ var (
 	sixToFour      = netip.MustParsePrefix("2002::/16")
 )
 
-// Resolver resolves host names; *net.Resolver satisfies it.
-type Resolver interface {
-	LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error)
-}
-
 // Policy is the callback-address policy. The zero value is not usable; build
 // one with New.
 type Policy struct {
@@ -102,9 +96,6 @@ type Policy struct {
 	// LocalAddrs returns this host's own interface addresses, every one of
 	// which is denied. Replaceable for tests.
 	LocalAddrs func() ([]netip.Addr, error)
-	// Resolver resolves sinful host names in CheckSinful. Defaults to
-	// net.DefaultResolver.
-	Resolver Resolver
 
 	mu        sync.Mutex
 	local     []netip.Addr
@@ -120,7 +111,6 @@ func New(allow []netip.Prefix) *Policy {
 	return &Policy{
 		allow:      allow,
 		LocalAddrs: InterfaceAddrs,
-		Resolver:   net.DefaultResolver,
 	}
 }
 
@@ -276,15 +266,12 @@ func (p *Policy) Control(_, address string, _ syscall.RawConn) error {
 
 // Target is a sinful that passed CheckSinful.
 type Target struct {
-	// Dial is the sinful to hand to cedar. Its host is the checked IP literal
-	// (with the original sock id, if any), so cedar connects to exactly the
-	// address that was checked and does not resolve the name again.
+	// Dial is the sinful to hand to cedar, in angle brackets. It is the
+	// address the CE sent: a host name in it is resolved by cedar at dial
+	// time, and Control checks whatever address that yields.
 	Dial string
-	// Host is the host portion of the original sinful.
+	// Host is the host portion of the sinful.
 	Host string
-	// Checked lists every address that was checked: the primary host's
-	// resolved addresses and every addrs= entry.
-	Checked []netip.Addr
 }
 
 // SinfulError reports a sinful refused for its form rather than its address.
@@ -295,10 +282,19 @@ func (e *SinfulError) Error() string { return "callback address refused: " + e.R
 // Is lets errors.Is(err, ErrDenied) match.
 func (e *SinfulError) Is(target error) bool { return target == ErrDenied }
 
-// CheckSinful validates a callback sinful before dialing: it rejects CCB contacts and private-network parts, checks every addrs=
-// entry, resolves a host name and checks every address it resolves to, and
-// returns a Target pinned to a checked IP.
-func (p *Policy) CheckSinful(ctx context.Context, raw string) (*Target, error) {
+// CheckSinful validates a callback sinful before any request is recorded. It
+// refuses CCB contacts and private-network parts, which would route the
+// callback through something other than the address itself, and a malformed
+// host:port or shared-port id. It also checks every IP literal the sinful
+// names (the host, when it is one, and each addrs= entry), so an obviously
+// denied address is refused up front with a clear reason.
+//
+// It does not resolve host names. The dial-time hook (Control, installed as
+// cedar's ClientConfig.DialControl) checks every concrete address cedar
+// connects to, after cedar's own resolution, so a name that resolves or is
+// rebound to a denied address is refused there; a resolution here would be
+// a second answer that the dial is not bound to.
+func (p *Policy) CheckSinful(raw string) (*Target, error) {
 	info, err := addresses.ParseSinful(raw)
 	if err != nil {
 		return nil, &SinfulError{Reason: fmt.Sprintf("unparseable sinful: %v", err)}
@@ -312,15 +308,12 @@ func (p *Policy) CheckSinful(ctx context.Context, raw string) (*Target, error) {
 	if info.Host == "" || info.Port == "" {
 		return nil, &SinfulError{Reason: "the address has no host:port"}
 	}
-	port, err := strconv.ParseUint(info.Port, 10, 16)
-	if err != nil || port == 0 {
+	if port, err := strconv.ParseUint(info.Port, 10, 16); err != nil || port == 0 {
 		return nil, &SinfulError{Reason: fmt.Sprintf("bad port %q", info.Port)}
 	}
 	if info.SharedPortID != "" && !addresses.IsValidSharedPortID(info.SharedPortID) {
 		return nil, &SinfulError{Reason: fmt.Sprintf("bad shared-port id %q", info.SharedPortID)}
 	}
-
-	t := &Target{Host: info.Host}
 	for _, entry := range info.Addrs {
 		a, err := parseAddrsEntry(entry)
 		if err != nil {
@@ -329,44 +322,17 @@ func (p *Policy) CheckSinful(ctx context.Context, raw string) (*Target, error) {
 		if err := p.CheckAddr(a); err != nil {
 			return nil, err
 		}
-		t.Checked = append(t.Checked, a)
 	}
-
-	host := strings.TrimSuffix(strings.TrimPrefix(info.Host, "["), "]")
-	var primary []netip.Addr
-	if a, err := netip.ParseAddr(host); err == nil {
-		primary = []netip.Addr{a}
-	} else {
-		res := p.Resolver
-		if res == nil {
-			res = net.DefaultResolver
-		}
-		primary, err = res.LookupNetIP(ctx, "ip", host)
-		if err != nil {
-			return nil, &SinfulError{Reason: fmt.Sprintf("resolving %s: %v", host, err)}
-		}
-		if len(primary) == 0 {
-			return nil, &SinfulError{Reason: fmt.Sprintf("%s resolves to no address", host)}
-		}
-	}
-	// Every resolved address must pass: a name that resolves to a public and a
-	// loopback address is not one to dial.
-	for _, a := range primary {
+	if a, err := netip.ParseAddr(strings.TrimSuffix(strings.TrimPrefix(info.Host, "["), "]")); err == nil {
 		if err := p.CheckAddr(a); err != nil {
 			return nil, err
 		}
-		t.Checked = append(t.Checked, a)
 	}
-	pin := primary[0].WithZone("")
-	if pin.Is4In6() {
-		pin = pin.Unmap()
+	dial := strings.TrimSpace(raw)
+	if !strings.HasPrefix(dial, "<") {
+		dial = "<" + dial + ">"
 	}
-	dial := netip.AddrPortFrom(pin, uint16(port)).String()
-	if info.SharedPortID != "" {
-		dial += "?sock=" + info.SharedPortID
-	}
-	t.Dial = "<" + dial + ">"
-	return t, nil
+	return &Target{Dial: dial, Host: info.Host}, nil
 }
 
 // parseAddrsEntry parses one entry of a sinful's addrs= list: "a.b.c.d-port"

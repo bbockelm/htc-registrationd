@@ -27,23 +27,21 @@ type callbackConn struct {
 // certificate verified against ServerName = name whatever host or alias the
 // sinful carries, and encryption required. The registrar presents no
 // certificate of its own.
+//
+// This is the one place the registrar dials an address a client chose, so the
+// SSRF policy is installed as cedar's dial hook: it runs after cedar resolves
+// the sinful's host, on each concrete address about to be connected (direct
+// or shared-port), and refuses any the policy denies. CheckSinful has only
+// checked the sinful's form and its IP literals.
 func (s *Service) dialCallback(ctx context.Context, target *ssrf.Target, name string) (*callbackConn, error) {
 	sc := cedarx.SSLOnly(s.cfg.CallbackSecurity(), protocol.RegCallback, name, target.Dial)
 	ccfg := &client.ClientConfig{
-		Address:    target.Dial,
-		Security:   sc,
-		Timeout:    s.cfg.CallbackConnectTimeout,
-		ClientName: "htc-registrationd",
+		Address:     target.Dial,
+		Security:    sc,
+		Timeout:     s.cfg.CallbackConnectTimeout,
+		ClientName:  "htc-registrationd",
+		DialControl: s.cfg.SSRF.Control,
 	}
-	// TODO(cedar-dialcontrol): wire the dial-time SSRF hook here, the single
-	// place the registrar dials an address a client chose, once a cedar tag
-	// ships ClientConfig.DialControl (bbockelm/cedar#93):
-	//
-	//	ccfg.DialControl = s.cfg.SSRF.Control
-	//
-	// Until then CheckSinful has already resolved and checked every address,
-	// and target.Dial is pinned to a checked IP literal, so cedar does not
-	// resolve a name again and there is no DNS-rebinding window.
 	cl, err := cedarx.DialSSL(ctx, ccfg)
 	if err != nil {
 		return nil, err
@@ -126,7 +124,7 @@ func (s *Service) requestCallback(ctx context.Context, c *cedarserver.Conn, req 
 		s.log.Warn("registrar: callback name refused", "name", name, "source", src, "reason", why)
 		return s.refuse(ctx, c, protocol.Err(protocol.ErrNameRefused, "%s", why))
 	}
-	target, err := s.cfg.SSRF.CheckSinful(ctx, req.CallbackAddress)
+	target, err := s.cfg.SSRF.CheckSinful(req.CallbackAddress)
 	if err != nil {
 		s.log.Warn("registrar: callback address refused", "name", name, "source", src,
 			"address", req.CallbackAddress, "err", err)
