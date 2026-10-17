@@ -110,8 +110,16 @@ CE:
 
 Registrar:
 
-- `SIGNING_KEY`: default `ce-registration`, read from
-  `SEC_PASSWORD_DIRECTORY`.
+- `SIGNING_KEY`: default `ce-registration`, the name of the signing key file
+  in `SEC_PASSWORD_DIRECTORY`. When the file does not exist, the registrar
+  creates it at startup and on every reconfig, as an HTCondor collector
+  creates its own signing key: 64 random bytes, root-owned, mode 0600, in
+  HTCondor's format. An existing file is never replaced. The collector on the
+  same host reads the same file and so accepts the tokens. With two central
+  collectors, copy the key file to the other one's `SEC_PASSWORD_DIRECTORY`
+  (root-owned, mode 0600) and set the same `TRUST_DOMAIN` on both, so a token
+  works on either. If a registrar there already created its own key, replace
+  that file with the copy.
 - `IDENTITY_DOMAIN`: default `$(UID_DOMAIN)`. The issuer is `TRUST_DOMAIN`.
 - `TOKEN_LIMITS`: default `ADVERTISE_SCHEDD`.
 - `TOKEN_LIFETIME`: default 72 h.

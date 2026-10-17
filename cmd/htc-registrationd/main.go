@@ -263,6 +263,19 @@ func setupRegistrar(ctx context.Context, d *daemon.Daemon, cfg *config.Config, s
 		Limits:   knobs.List(cfg, "HTC_REGISTRATIOND_TOKEN_LIMITS", []string{"ADVERTISE_SCHEDD"}),
 		Lifetime: lifetime,
 	}
+	// Like an HTCondor collector with its signing key, create the key when it
+	// is missing, at startup and on every reconfig; an existing key is never
+	// replaced.
+	createKey := func() {
+		if created, err := m.CreateKeyIfMissing(); err != nil {
+			log.Error("could not create the token signing key", "err", err)
+		} else if created {
+			path, _ := m.KeyFile()
+			log.Info("created the token signing key", "file", path)
+		}
+	}
+	createKey()
+	d.OnReconfig(func(*config.Config) { createKey() })
 	if err := m.Check(); err != nil {
 		log.Error("the signing key is not usable; every issuance will fail until it is", "err", err)
 	}
