@@ -192,7 +192,8 @@ used as identity.
   restart asks those users to sign in again.
 
 Pages: `/approve` (enter a code, or `/approve?code=XXXX-XXXX`: the request's
-CE name, code, source address and its reverse DNS, time and CE version, and
+CE name, code, source address and its reverse DNS, time, the version of
+htc-registrationd the CE runs, and
 whether the logged-in user may approve it and why), `/registrations` (the
 registrations the user approved or is authorized for, all of them for an
 administrator; revoking one takes current authorization for its name, or

@@ -244,8 +244,12 @@ type NewRequest struct {
 // ErrUserCodeTaken reports a user-code collision; the caller draws another.
 var ErrUserCodeTaken = errors.New("user code already in use")
 
-// CreateRequest records a new request and returns its number.
+// CreateRequest records a new request and returns its number. A CEVersion
+// that is not a plain version string is recorded as empty.
 func (s *Store) CreateRequest(ctx context.Context, r NewRequest) (int64, error) {
+	if !validCEVersion(r.CEVersion) {
+		r.CEVersion = ""
+	}
 	now := s.now()
 	var code any
 	if r.UserCode != "" {

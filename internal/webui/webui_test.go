@@ -198,7 +198,7 @@ func (h *harness) pending(name, code string) {
 		Name:          name,
 		Method:        protocol.MethodApproval,
 		SourceIP:      "192.0.2.10",
-		CEVersion:     "$CondorVersion: 25.0.0 2026-01-01 $ htc-registrationd/test",
+		CEVersion:     "0.3.0-test",
 		UserCode:      code,
 		Status:        registrar.ReqPending,
 		TTL:           30 * time.Minute,
@@ -236,7 +236,7 @@ func TestLoginThenApprove(t *testing.T) {
 		"192.0.2.10",
 		"ce1.example.edu, which resolves back to this address",
 		"2027-01-15 08:00 UTC", // requested at
-		"htc-registrationd/test",
+		"<dt>CE version</dt><dd>0.3.0-test</dd>",
 		"You are authorized to approve " + testCE,
 		"Allowed by the registrar&#39;s map file",
 		`value="approve"`,
