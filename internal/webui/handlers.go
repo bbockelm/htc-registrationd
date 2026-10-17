@@ -155,7 +155,7 @@ func (s *Server) checkPost(w http.ResponseWriter, r *http.Request, sess *session
 		s.message(w, r, http.StatusBadRequest, "Bad request", "The form could not be read.")
 		return false
 	}
-	if !sameOrigin(r, s.origin) || !csrfOK(r, sess) {
+	if !sameOrigin(r, s.cfg.PublicURL) || !csrfOK(r, sess) {
 		s.message(w, r, http.StatusForbidden, "Request refused", "The form did not come from this page. Reload the page and try again.")
 		return false
 	}

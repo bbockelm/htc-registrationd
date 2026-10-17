@@ -163,10 +163,11 @@ used as identity.
   set `X-Forwarded-For`; on this listener its last entry is the address
   requests are rate-limited by, and it is used for nothing else.
 - `PUBLIC_URL`: required; the `https://` origin browsers and CEs use, with no
-  path (`http://` only for a loopback host).
+  path (`http://` only for a loopback host). It is used in lower case and
+  without a default port (`:443`).
 - `OIDC_ISSUER`: the provider's issuer URL, read via
-  `/.well-known/openid-configuration`. Register `<PUBLIC_URL>/oidc/callback`
-  as the client's redirect URI.
+  `/.well-known/openid-configuration`. Register `<PUBLIC_URL>/oidc/callback`,
+  in that form, as the client's redirect URI.
 - `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET_FILE` (may be root-only; re-read on
   reconfig).
 - `OIDC_SCOPES`: default `openid email profile`. CILogon needs

@@ -861,6 +861,10 @@ func TestFromConfig(t *testing.T) {
 			t.Errorf("%s: accepted", desc)
 		}
 	}
+	if c, err := FromConfig(with("HTC_REGISTRATIOND_PUBLIC_URL", "HTTPS://Registrar.Example.org:443")); err != nil ||
+		c.VerificationURI() != "https://registrar.example.org/approve" {
+		t.Errorf("non-canonical public URL: %v", err)
+	}
 	if _, err := FromConfig(with("HTC_REGISTRATIOND_HTTP_ADDR", "127.0.0.1:8080")); err != nil {
 		t.Errorf("loopback HTTP: %v", err)
 	}
@@ -967,5 +971,64 @@ func TestLimiterEvictsLeastRecent(t *testing.T) {
 	}
 	if !l.allow("192.0.2.2") {
 		t.Error("the evicted client was not forgotten")
+	}
+}
+
+func TestPublicURLIsCanonical(t *testing.T) {
+	for raw, want := range map[string]string{
+		"https://registrar.example.org":         "https://registrar.example.org",
+		"HTTPS://Registrar.Example.ORG:443/":    "https://registrar.example.org",
+		"https://registrar.example.org:8443":    "https://registrar.example.org:8443",
+		"http://LocalHost:80":                   "http://localhost",
+		"http://[::1]:8080":                     "http://[::1]:8080",
+		"https://[2001:DB8::1]:443":             "https://[2001:db8::1]",
+		"https://registrar.example.org:80":      "https://registrar.example.org:80",
+		"http://registrar.example.org:443/path": "http://registrar.example.org:443",
+	} {
+		if got, err := canonicalOrigin(raw); err != nil || got != want {
+			t.Errorf("canonicalOrigin(%q) = %q, %v; want %q", raw, got, err, want)
+		}
+	}
+
+	// A form posted by a browser, whose Origin is canonical, is accepted
+	// when PUBLIC_URL is not written canonically.
+	h := newHarness(t)
+	srv, err := New(context.Background(), Config{
+		PublicURL: "https://Registrar.Example.ORG:443/",
+		OIDC:      OIDCConfig{Issuer: h.idp.URL(), ClientID: h.idp.clientID},
+		Store:     h.store,
+		Authz:     h.policy,
+		Now:       h.clock.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := srv.redirectURL(); got != "https://registrar.example.org/oidc/callback" {
+		t.Errorf("redirect URI %q", got)
+	}
+	id, sess, err := srv.sessions.create(context.Background(), h.idp.URL()+",alice", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Signing out ends the session, so the accepted origin comes last.
+	for _, tc := range []struct {
+		origin string
+		want   int
+	}{
+		{"https://evil.example", http.StatusForbidden},
+		{"https://registrar.example.org:443", http.StatusForbidden}, // browsers never send this
+		{"https://registrar.example.org", http.StatusOK},
+	} {
+		origin, want := tc.origin, tc.want
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/logout",
+			strings.NewReader(url.Values{"csrf": {sess.CSRF}}.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Origin", origin)
+		req.AddCookie(&http.Cookie{Name: "__Host-" + sessionCookie, Value: id, Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode})
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != want {
+			t.Errorf("Origin %s: %d, want %d", origin, rec.Code, want)
+		}
 	}
 }

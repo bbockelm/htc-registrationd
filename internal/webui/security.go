@@ -152,7 +152,7 @@ func safeNext(next string) bool {
 }
 
 // sameOrigin checks a state-changing request's Origin (when the browser
-// sends one) against the public URL.
+// sends one) against the public URL's canonical origin.
 func sameOrigin(r *http.Request, origin string) bool {
 	o := r.Header.Get("Origin")
 	return o == "" || o == origin
