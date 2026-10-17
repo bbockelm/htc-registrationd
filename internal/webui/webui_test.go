@@ -3,6 +3,7 @@ package webui
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -1030,5 +1031,71 @@ func TestPublicURLIsCanonical(t *testing.T) {
 		if rec.Code != want {
 			t.Errorf("Origin %s: %d, want %d", origin, rec.Code, want)
 		}
+	}
+}
+
+func TestDiscoveryOutlivesTheBrowserThatStartedIt(t *testing.T) {
+	release := make(chan struct{})
+	var hits atomic.Int32
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"issuer": srv.URL, "authorization_endpoint": srv.URL + "/authorize",
+			"token_endpoint": srv.URL + "/token", "userinfo_endpoint": srv.URL + "/userinfo",
+		})
+	}))
+	t.Cleanup(srv.Close)
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(unblock) // runs before srv.Close, which waits for the handler
+	p := newOIDCProvider(OIDCConfig{Issuer: srv.URL})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	first := make(chan error, 1)
+	go func() {
+		_, err := p.endpoints(ctx)
+		first <- err
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for hits.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("discovery did not start")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// The provider's lock is free while discovery runs.
+	done := make(chan struct{})
+	go func() {
+		p.setSecret("new-secret")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the lock is held across discovery")
+	}
+
+	// The browser that started discovery goes away; it stops waiting...
+	cancel()
+	select {
+	case err := <-first:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled caller: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a canceled caller kept waiting")
+	}
+	// ...but discovery completes, once, for everyone else.
+	unblock()
+	ep, err := p.endpoints(context.Background())
+	if err != nil || ep.AuthURL != srv.URL+"/authorize" {
+		t.Fatalf("after the first browser left: %+v, %v", ep, err)
+	}
+	if n := hits.Load(); n != 1 {
+		t.Errorf("discovery ran %d times", n)
 	}
 }
