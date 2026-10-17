@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"net"
 
 	"github.com/bbockelm/golang-htcondor/config"
 	"github.com/bbockelm/golang-htcondor/daemon"
@@ -14,20 +15,23 @@ import (
 
 // registrarWeb is the registrar's authorization backends
 // (HTC_REGISTRATIOND_AUTHZ, HTC_REGISTRATIOND_ADMINS) and its approval web
-// UI (HTC_REGISTRATIOND_HTTPS_ADDR / HTTP_ADDR).
+// UI (the shared port, HTC_REGISTRATIOND_HTTPS_ADDR, HTTP_ADDR).
 type registrarWeb struct {
 	log    *slog.Logger
 	policy *authz.Policy
 	web    *webui.Config
 }
 
-func newRegistrarWeb(d *daemon.Daemon, cfg *config.Config) (*registrarWeb, error) {
+// sharedPort is the listener for HTTP and TLS connections forwarded by the
+// shared port, or nil when SHARED_PORT_HTTP_FORWARDING_ID does not name
+// this daemon.
+func newRegistrarWeb(d *daemon.Daemon, cfg *config.Config, sharedPort net.Listener) (*registrarWeb, error) {
 	log := d.Slog()
 	policy, err := authz.FromConfig(cfg, log)
 	if err != nil {
 		return nil, err
 	}
-	web, err := webui.FromConfig(cfg)
+	web, err := webui.FromConfig(cfg, sharedPort != nil)
 	if err != nil {
 		return nil, err
 	}
@@ -62,8 +66,14 @@ func (w *registrarWeb) verificationURI() string {
 
 // start runs the backends and, if configured, the web UI. The returned
 // function stops the web UI; it must run before the store is closed.
-func (w *registrarWeb) start(ctx context.Context, d *daemon.Daemon, store *registrar.Store) (func(), error) {
+func (w *registrarWeb) start(ctx context.Context, d *daemon.Daemon, store *registrar.Store,
+	sharedPort net.Listener) (func(), error) {
 	w.policy.Start(ctx)
+	if sharedPort != nil && !w.web.SharedPort {
+		w.log.Warn("SHARED_PORT_HTTP_FORWARDING_ID names this daemon, but HTC_REGISTRATIOND_PUBLIC_URL is not set; " +
+			"forwarded HTTP and TLS connections are closed")
+		_ = sharedPort.Close()
+	}
 	var srv *webui.Server
 	stop := func() {}
 	if w.web.Enabled() {
@@ -77,7 +87,7 @@ func (w *registrarWeb) start(ctx context.Context, d *daemon.Daemon, store *regis
 		if srv, err = webui.New(ctx, c); err != nil {
 			return nil, err
 		}
-		if stop, err = srv.Start(ctx); err != nil {
+		if stop, err = srv.Start(ctx, sharedPort); err != nil {
 			return nil, err
 		}
 	}
@@ -88,6 +98,6 @@ func (w *registrarWeb) start(ctx context.Context, d *daemon.Daemon, store *regis
 		}
 	})
 	w.log.Info("registrar authorization", "backends", w.policy.Backends(), "web_ui", w.web.Enabled(),
-		"public_url", w.web.PublicURL)
+		"public_url", w.web.PublicURL, "web_ui_on_shared_port", w.web.SharedPort)
 	return stop, nil
 }

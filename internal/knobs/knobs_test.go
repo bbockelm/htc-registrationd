@@ -170,3 +170,21 @@ func TestCEName(t *testing.T) {
 }
 
 var errNoSuchHost = errors.New("no such host")
+
+func TestHTTPForwardingID(t *testing.T) {
+	for _, tc := range []struct {
+		cfg  Map
+		want string
+	}{
+		{Map{}, ""},
+		{Map{"SHARED_PORT_HTTP_FORWARDING_ID": "htc_registrationd"}, "htc_registrationd"},
+		{Map{"DAEMON_LIST": "MASTER, COLLECTOR http_api"}, "http_api"},
+		{Map{"DAEMON_LIST": "MASTER HTTP_API", "SHARED_PORT_HTTP_FORWARDING_ID": "htc_registrationd"}, "htc_registrationd"},
+		{Map{"DAEMON_LIST": "MASTER HTTP_API", "SHARED_PORT_HTTP_FORWARDING_ID": " "}, "http_api"},
+		{Map{"DAEMON_LIST": "MASTER HTTP_API_X"}, ""},
+	} {
+		if got := HTTPForwardingID(tc.cfg); got != tc.want {
+			t.Errorf("%v: %q, want %q", tc.cfg, got, tc.want)
+		}
+	}
+}

@@ -112,7 +112,7 @@ func TestServeHTTPS(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	stop, err := srv.Start(ctx)
+	stop, err := srv.Start(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

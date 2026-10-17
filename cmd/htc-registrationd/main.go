@@ -39,6 +39,7 @@ import (
 	"github.com/bbockelm/htc-registrationd/internal/cedarx"
 	"github.com/bbockelm/htc-registrationd/internal/knobs"
 	"github.com/bbockelm/htc-registrationd/internal/mint"
+	"github.com/bbockelm/htc-registrationd/internal/portsplit"
 	"github.com/bbockelm/htc-registrationd/internal/protocol"
 	"github.com/bbockelm/htc-registrationd/internal/registrar"
 	"github.com/bbockelm/htc-registrationd/internal/ssrf"
@@ -102,6 +103,15 @@ func run() error {
 		return fmt.Errorf("listener: %w", err)
 	}
 	defer func() { _ = ln.Close() }()
+	// webLn carries the HTTP and TLS connections HTCondor's shared port
+	// forwards here when SHARED_PORT_HTTP_FORWARDING_ID names this daemon's
+	// endpoint; CEDAR keeps the rest.
+	var webLn net.Listener
+	if id := d.SharedPortName(); id != "" && id == knobs.HTTPForwardingID(cfg) {
+		split := portsplit.Split(ln, log)
+		ln, webLn = split.CEDAR(), split.Web()
+		log.Info("the shared port forwards HTTP and TLS connections to this daemon", "endpoint", id)
+	}
 
 	sec, err := d.ServerSecurityConfig(protocol.RegStatus, "DEFAULT")
 	if err != nil {
@@ -154,12 +164,17 @@ func run() error {
 
 	switch mode {
 	case "registrar":
-		closeFn, err := setupRegistrar(ctx, d, cfg, cur.Load, srv)
+		closeFn, err := setupRegistrar(ctx, d, cfg, cur.Load, srv, webLn)
 		if err != nil {
 			return err
 		}
 		defer closeFn()
 	case "ce":
+		if webLn != nil {
+			log.Warn("SHARED_PORT_HTTP_FORWARDING_ID names this daemon, which serves no web UI in ce mode; " +
+				"forwarded HTTP and TLS connections are closed")
+			_ = webLn.Close()
+		}
 		if err := setupCE(ctx, d, cfg, cur.Load, srv, ln); err != nil {
 			return err
 		}
@@ -313,7 +328,7 @@ func registrarTunables(cfg knobs.Getter, web *registrarWeb) (registrar.Tunables,
 }
 
 func setupRegistrar(ctx context.Context, d *daemon.Daemon, cfg *config.Config, cur func() *config.Config,
-	srv *cedarserver.Server) (func(), error) {
+	srv *cedarserver.Server, webLn net.Listener) (func(), error) {
 	log := d.Slog()
 	issuer, err := trustDomain(cfg)
 	if err != nil {
@@ -362,7 +377,7 @@ func setupRegistrar(ctx context.Context, d *daemon.Daemon, cfg *config.Config, c
 		return nil, fmt.Errorf("HTC_REGISTRATIOND_CALLBACK_ALLOW_NETWORKS: %w", err)
 	}
 
-	web, err := newRegistrarWeb(d, cfg)
+	web, err := newRegistrarWeb(d, cfg, webLn)
 	if err != nil {
 		_ = store.Close()
 		return nil, err
@@ -405,7 +420,7 @@ func setupRegistrar(ctx context.Context, d *daemon.Daemon, cfg *config.Config, c
 		svc.Reconfigure(t)
 	})
 	svc.Register(srv)
-	stopWeb, err := web.start(ctx, d, store)
+	stopWeb, err := web.start(ctx, d, store, webLn)
 	if err != nil {
 		_ = store.Close()
 		return nil, err

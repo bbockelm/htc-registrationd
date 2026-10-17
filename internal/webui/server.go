@@ -51,6 +51,10 @@ type Config struct {
 	HTTPSAddr string
 	CertFile  string
 	KeyFile   string
+	// SharedPort serves HTTPS, with CertFile and KeyFile, on the listener
+	// passed to Start: the connections HTCondor's shared port forwards to
+	// this daemon because SHARED_PORT_HTTP_FORWARDING_ID names it.
+	SharedPort bool
 	// HTTPAddr is a plain-HTTP listener on a loopback address, for a
 	// reverse proxy that terminates TLS.
 	HTTPAddr string
@@ -81,11 +85,13 @@ type Config struct {
 }
 
 // Enabled reports whether any listener is configured.
-func (c *Config) Enabled() bool { return c.HTTPSAddr != "" || c.HTTPAddr != "" }
+func (c *Config) Enabled() bool { return c.HTTPSAddr != "" || c.HTTPAddr != "" || c.SharedPort }
 
-// FromConfig reads the web UI's knobs. A configuration with no listener is
-// returned with Enabled() false.
-func FromConfig(cfg knobs.Getter) (*Config, error) {
+// FromConfig reads the web UI's knobs. sharedPort reports that HTCondor's
+// shared port forwards HTTP and TLS connections to this daemon; the UI is
+// then served there when HTC_REGISTRATIOND_PUBLIC_URL is set. A
+// configuration with no listener is returned with Enabled() false.
+func FromConfig(cfg knobs.Getter, sharedPort bool) (*Config, error) {
 	c := &Config{
 		PublicURL:        strings.TrimRight(knobs.String(cfg, "HTC_REGISTRATIOND_PUBLIC_URL", ""), "/"),
 		HTTPSAddr:        knobs.String(cfg, "HTC_REGISTRATIOND_HTTPS_ADDR", ""),
@@ -117,6 +123,7 @@ func FromConfig(cfg knobs.Getter) (*Config, error) {
 	if c.SessionLifetime, err = knobs.Duration(cfg, "HTC_REGISTRATIOND_SESSION_LIFETIME", 12*time.Hour); err != nil {
 		return nil, err
 	}
+	c.SharedPort = sharedPort && c.PublicURL != ""
 	if !c.Enabled() {
 		return c, nil
 	}
@@ -177,6 +184,10 @@ func (c *Config) validate() error {
 	if c.HTTPSAddr != "" && (c.CertFile == "" || c.KeyFile == "") {
 		return errors.New("HTC_REGISTRATIOND_HTTPS_ADDR needs HTC_REGISTRATIOND_HTTPS_CERTFILE and HTC_REGISTRATIOND_HTTPS_KEYFILE")
 	}
+	if c.SharedPort && (c.CertFile == "" || c.KeyFile == "") {
+		return errors.New("the web UI on the shared port (SHARED_PORT_HTTP_FORWARDING_ID names this daemon) needs " +
+			"HTC_REGISTRATIOND_HTTPS_CERTFILE and HTC_REGISTRATIOND_HTTPS_KEYFILE")
+	}
 	if c.HTTPAddr != "" {
 		host, _, err := net.SplitHostPort(c.HTTPAddr)
 		if err != nil || !isLoopbackHost(host) {
@@ -218,7 +229,8 @@ const (
 )
 
 // New builds the web UI. It reads the client secret and, with an HTTPS
-// listener, the TLS keypair, and fails if either cannot be read.
+// listener or the shared port, the TLS keypair, and fails if either cannot
+// be read.
 func New(ctx context.Context, cfg Config) (*Server, error) {
 	if cfg.Store == nil || cfg.Authz == nil {
 		return nil, errors.New("webui: a Store and an Authorizer are required")
@@ -273,7 +285,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		approveLimit: newIPLimiter(approvePerMinute, approvePerMinute, cfg.Now),
 		secure:       strings.HasPrefix(origin, "https://"),
 	}
-	if cfg.HTTPSAddr != "" {
+	if cfg.HTTPSAddr != "" || cfg.SharedPort {
 		if s.certs, err = newCertReloader(cfg.CertFile, cfg.KeyFile, cfg.ReadCredential, s.log); err != nil {
 			return nil, err
 		}
@@ -321,8 +333,11 @@ var listenTCP = func(addr string) (net.Listener, error) {
 }
 
 // Start binds the configured listeners and serves until ctx ends or stop is
-// called; stop waits for in-flight requests (up to 10 s).
-func (s *Server) Start(ctx context.Context) (stop func(), err error) {
+// called; stop waits for in-flight requests (up to 10 s). With SharedPort,
+// it serves HTTPS on sharedPort, the forwarded connections; a plain HTTP
+// request there is answered 400, as on any HTTPS port. Stopping closes
+// sharedPort.
+func (s *Server) Start(ctx context.Context, sharedPort net.Listener) (stop func(), err error) {
 	var servers []*http.Server
 	var lns []net.Listener
 	closeAll := func() {
@@ -330,16 +345,24 @@ func (s *Server) Start(ctx context.Context) (stop func(), err error) {
 			_ = ln.Close()
 		}
 	}
+	if s.cfg.SharedPort && sharedPort == nil {
+		return nil, errors.New("webui: the shared port is configured, but no shared-port listener was passed")
+	}
+	tlsConfig := &tls.Config{
+		MinVersion:     tls.VersionTLS12,
+		GetCertificate: s.certs.GetCertificate,
+		NextProtos:     []string{"h2", "http/1.1"},
+	}
+	if s.cfg.SharedPort {
+		lns = append(lns, tls.NewListener(sharedPort, tlsConfig))
+	}
 	if s.cfg.HTTPSAddr != "" {
 		ln, err := listenTCP(s.cfg.HTTPSAddr)
 		if err != nil {
+			closeAll()
 			return nil, fmt.Errorf("webui: HTTPS listener: %w", err)
 		}
-		lns = append(lns, tls.NewListener(ln, &tls.Config{
-			MinVersion:     tls.VersionTLS12,
-			GetCertificate: s.certs.GetCertificate,
-			NextProtos:     []string{"h2", "http/1.1"},
-		}))
+		lns = append(lns, tls.NewListener(ln, tlsConfig))
 	}
 	if s.cfg.HTTPAddr != "" {
 		ln, err := listenTCP(s.cfg.HTTPAddr)

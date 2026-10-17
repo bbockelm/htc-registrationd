@@ -509,6 +509,21 @@ trusted too) and their `AUTH_SSL_SERVER_*` counterparts.
 `condor_ce_reconfig` applies most changes; [protocol.md](docs/protocol.md#reconfiguration)
 lists the knobs that take a restart.
 
+### Web UI on the shared port
+
+With `SHARED_PORT_HTTP_FORWARDING_ID = htc_registrationd` (HTCondor 25.7.2
+or later; commented out in the web UI section of
+`50-htc-registrationd-registrar.conf`), the
+shared port passes connections that open with an HTTP request or a TLS
+ClientHello to the registrar, which serves the web UI there when
+`PUBLIC_URL` is set to the shared port's origin, such as
+`https://collector.example.org:9619`. TLS ends in the registrar, with
+`HTTPS_CERTFILE` and `HTTPS_KEYFILE`; plain HTTP is answered 400. CEDAR
+commands use the same port. Only one daemon per host can be the target, and
+htcondor-api (`HTTP_API` in `DAEMON_LIST`) is the target when the knob is
+unset, so a host running both must choose. `HTTPS_ADDR` still adds a port
+of its own. The registrar reads the knob at startup.
+
 ## Development
 
 ```
