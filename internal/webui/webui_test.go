@@ -477,9 +477,12 @@ func TestPKCEVerifierIsChecked(t *testing.T) {
 	c.CheckRedirect = func(req *http.Request, _ []*http.Request) error {
 		// Swap the stored verifier just before the callback is handled.
 		if req.URL.Path == "/oidc/callback" {
-			if _, err := h.store.DB().ExecContext(context.Background(), `UPDATE web_logins SET verifier = 'wrong-verifier-wrong-verifier-wrong-verifier'`); err != nil {
-				t.Fatal(err)
+			l := h.srv.logins
+			l.mu.Lock()
+			for e := l.order.Front(); e != nil; e = e.Next() {
+				e.Value.(*pendingLogin).verifier = "wrong-verifier-wrong-verifier-wrong-verifier"
 			}
+			l.mu.Unlock()
 		}
 		return nil
 	}
@@ -868,5 +871,101 @@ func TestFromConfig(t *testing.T) {
 		"HTC_REGISTRATIOND_OIDC_CLIENT_ID": "cid",
 	}); err != nil {
 		t.Errorf("loopback-only setup: %v", err)
+	}
+}
+
+func TestLoginStartWritesNothingToTheDatabase(t *testing.T) {
+	h := newHarness(t)
+	c := h.browser()
+	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	db := h.store.DB()
+	var before, after int
+	if err := db.QueryRowContext(context.Background(), `SELECT count(*) FROM web_sessions`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	for range 5 {
+		if _, code := h.get(c, "/login"); code != http.StatusFound {
+			t.Fatalf("login: %d", code)
+		}
+	}
+	if err := db.QueryRowContext(context.Background(), `SELECT count(*) FROM web_sessions`).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	var tables int
+	if err := db.QueryRowContext(context.Background(),
+		`SELECT count(*) FROM sqlite_master WHERE name = 'web_logins'`).Scan(&tables); err != nil {
+		t.Fatal(err)
+	}
+	if before != after || tables != 0 || h.srv.logins.len() != 5 {
+		t.Fatalf("sessions %d -> %d, web_logins tables %d, logins in memory %d", before, after, tables, h.srv.logins.len())
+	}
+}
+
+func TestLoginStoreIsBounded(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+	l := newLoginStore(clock.Now, 3)
+	for _, st := range []string{"a", "b", "c", "d"} {
+		l.save(st, "v-"+st, "/"+st)
+	}
+	if l.len() != 3 {
+		t.Fatalf("holding %d logins, want 3", l.len())
+	}
+	if _, _, ok := l.take("a"); ok {
+		t.Error("the oldest login was not dropped")
+	}
+	if v, next, ok := l.take("d"); !ok || v != "v-d" || next != "/d" {
+		t.Errorf("newest login: %q %q %v", v, next, ok)
+	}
+	if _, _, ok := l.take("d"); ok {
+		t.Error("a login was taken twice")
+	}
+	clock.Advance(loginTTL + time.Second)
+	if _, _, ok := l.take("b"); ok {
+		t.Error("an expired login was taken")
+	}
+	l.save("e", "v-e", "/e")
+	if l.len() != 1 {
+		t.Errorf("expired logins kept: %d held", l.len())
+	}
+}
+
+func TestLimiterNetworks(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+	l := newIPLimiter(1, 1, clock.Now)
+	for _, tc := range []struct {
+		ip    string
+		allow bool
+	}{
+		{"2001:db8:1:2::1", true},
+		{"2001:db8:1:2:ffff::9", false}, // same /64
+		{"2001:db8:1:3::1", true},       // next /64
+		{"192.0.2.1", true},
+		{"::ffff:192.0.2.1", false}, // the same IPv4 address
+		{"192.0.2.2", true},
+	} {
+		if got := l.allow(tc.ip); got != tc.allow {
+			t.Errorf("allow(%s) = %v, want %v", tc.ip, got, tc.allow)
+		}
+	}
+}
+
+func TestLimiterEvictsLeastRecent(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+	l := newIPLimiter(1, 1, clock.Now)
+	l.max = 2
+	l.allow("192.0.2.1") // spends 192.0.2.1's token
+	l.allow("192.0.2.2")
+	if l.allow("192.0.2.1") { // and touches it
+		t.Fatal("192.0.2.1 was not limited")
+	}
+	l.allow("192.0.2.3") // full: forgets 192.0.2.2, the least recent
+	if l.allow("192.0.2.1") {
+		t.Error("a full limiter forgot a recent client")
+	}
+	if len(l.clients) != 2 || l.lru.Len() != 2 {
+		t.Errorf("holding %d/%d clients, want 2", len(l.clients), l.lru.Len())
+	}
+	if !l.allow("192.0.2.2") {
+		t.Error("the evicted client was not forgotten")
 	}
 }

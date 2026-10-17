@@ -180,14 +180,15 @@ used as identity.
   users by `OIDC_PRINCIPAL_CLAIM` value. They may approve any name, and see
   and revoke every registration. Re-read on reconfig.
 - `SESSION_IDLE` (1 h), `SESSION_LIFETIME` (12 h). Sessions are kept in the
-  registrar's database.
+  registrar's database; sign-ins in progress are kept in memory, so a
+  restart asks those users to sign in again.
 
 Pages: `/approve` (enter a code, or `/approve?code=XXXX-XXXX`: the request's
 CE name, code, source address and its reverse DNS, time and CE version, and
 whether the logged-in user may approve it and why), `/registrations` (the
 registrations the user approved or is authorized for, all of them for an
 administrator, with revoke), `/healthz`. Login and approve requests are
-rate-limited per client address.
+rate-limited per client address (per /64 for IPv6).
 
 ### Authorization backends (registrar)
 

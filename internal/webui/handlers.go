@@ -181,11 +181,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	verifier := oauth2.GenerateVerifier()
-	if err := s.sessions.saveLogin(r.Context(), state, verifier, next); err != nil {
-		s.log.Error("webui: recording login", "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
+	s.logins.save(state, verifier, next)
 	// The state is bound to this browser: the callback must present it
 	// both in the URL and in this cookie.
 	s.setCookie(w, loginCookie, state, int(loginTTL/time.Second))
@@ -208,11 +204,8 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		s.message(w, r, http.StatusBadRequest, "Sign-in failed", "This sign-in did not start in this browser, or took too long. Start again.")
 		return
 	}
-	verifier, next, err := s.sessions.takeLogin(r.Context(), state)
-	if err != nil {
-		if !errors.Is(err, errNoSession) {
-			s.log.Error("webui: reading login", "err", err)
-		}
+	verifier, next, ok := s.logins.take(state)
+	if !ok {
 		s.message(w, r, http.StatusBadRequest, "Sign-in failed", "This sign-in expired or was already used. Start again.")
 		return
 	}

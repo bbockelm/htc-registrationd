@@ -1,8 +1,10 @@
 package webui
 
 import (
+	"container/list"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
@@ -61,23 +63,27 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
-// ipLimiter is a token bucket per client address.
+// ipLimiter is a token bucket per client network: the address for IPv4,
+// its /64 for IPv6, since one host commonly holds a whole /64.
 type ipLimiter struct {
 	limit rate.Limit
 	burst int
 	now   func() time.Time
+	max   int
 
 	mu      sync.Mutex
-	clients map[string]*limiterEntry
+	clients map[string]*list.Element
+	// lru holds *limiterEntry, least recently seen first.
+	lru *list.List
 }
 
 type limiterEntry struct {
-	l    *rate.Limiter
-	seen time.Time
+	key string
+	l   *rate.Limiter
 }
 
-// maxLimiterClients bounds the limiter's memory; idle entries are dropped
-// first.
+// maxLimiterClients bounds the limiter's memory; when it is full the
+// least recently seen network is forgotten.
 const maxLimiterClients = 10000
 
 func newIPLimiter(perMinute, burst int, now func() time.Time) *ipLimiter {
@@ -85,31 +91,48 @@ func newIPLimiter(perMinute, burst int, now func() time.Time) *ipLimiter {
 		limit:   rate.Limit(float64(perMinute) / 60),
 		burst:   burst,
 		now:     now,
-		clients: map[string]*limiterEntry{},
+		max:     maxLimiterClients,
+		clients: map[string]*list.Element{},
+		lru:     list.New(),
 	}
 }
 
+// limiterKey is the network ip is limited as: the address for IPv4
+// (including IPv4-mapped IPv6), the /64 for IPv6. Anything else is used
+// as it is.
+func limiterKey(ip string) string {
+	a, err := netip.ParseAddr(ip)
+	if err != nil {
+		return ip
+	}
+	a = a.Unmap()
+	if a.Is4() {
+		return a.String()
+	}
+	p, err := a.WithZone("").Prefix(64)
+	if err != nil {
+		return ip
+	}
+	return p.String()
+}
+
 func (l *ipLimiter) allow(ip string) bool {
+	key := limiterKey(ip)
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	now := l.now()
-	e := l.clients[ip]
-	if e == nil {
-		if len(l.clients) >= maxLimiterClients {
-			for k, v := range l.clients {
-				if now.Sub(v.seen) > 10*time.Minute {
-					delete(l.clients, k)
-				}
-			}
-			if len(l.clients) >= maxLimiterClients {
-				l.clients = map[string]*limiterEntry{}
-			}
+	el := l.clients[key]
+	if el == nil {
+		for l.lru.Len() >= l.max {
+			oldest := l.lru.Front()
+			l.lru.Remove(oldest)
+			delete(l.clients, oldest.Value.(*limiterEntry).key)
 		}
-		e = &limiterEntry{l: rate.NewLimiter(l.limit, l.burst)}
-		l.clients[ip] = e
+		el = l.lru.PushBack(&limiterEntry{key: key, l: rate.NewLimiter(l.limit, l.burst)})
+		l.clients[key] = el
+	} else {
+		l.lru.MoveToBack(el)
 	}
-	e.seen = now
-	return e.l.AllowN(now, 1)
+	return el.Value.(*limiterEntry).l.AllowN(l.now(), 1)
 }
 
 // safeNext reports whether next is a same-origin path to return to after

@@ -159,6 +159,7 @@ type Server struct {
 	cfg      Config
 	log      *slog.Logger
 	sessions *sessionStore
+	logins   *loginStore
 	oidc     *oidcProvider
 	certs    *certReloader
 	pages    *pages
@@ -222,6 +223,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		cfg:          cfg,
 		log:          cfg.Logger,
 		sessions:     sessions,
+		logins:       newLoginStore(cfg.Now, maxPendingLogins),
 		oidc:         newOIDCProvider(cfg.OIDC),
 		pages:        pg,
 		loginLimit:   newIPLimiter(loginPerMinute, loginPerMinute, cfg.Now),
