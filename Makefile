@@ -3,7 +3,8 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X main.version=$(VERSION)
 export GOWORK := off
 
-.PHONY: all build test test-race vet lint fmt clean rpm rpm-build
+.PHONY: all build test test-race vet lint fmt clean rpm rpm-build \
+	demo demo-build demo-status demo-revoke demo-renew demo-request demo-approve demo-advertise demo-clean
 
 all: build
 
@@ -28,6 +29,46 @@ fmt:
 
 clean:
 	rm -rf bin dist packaging/staging
+
+# --- Laptop demo -----------------------------------------------------------
+# `make demo` runs a registrar, a mock OpenID provider, two CEs and, when
+# HTCondor is installed (condor_collector on PATH, or CONDOR_BIN), a
+# CE-Collector, all on loopback. State lives in $(DEMO_DIR).
+
+DEMO_DIR ?= .demo
+DEMO      = bin/htc-registrationd-demo -dir $(DEMO_DIR) -daemon bin/htc-registrationd
+
+demo-build: build
+	$(GO) build -o bin/htc-registrationd-demo ./cmd/htc-registrationd-demo
+
+demo: demo-build
+	@$(DEMO) run
+
+demo-status: demo-build
+	@$(DEMO) status
+
+demo-revoke: demo-build
+	@test -n "$(NAME)" || { echo "usage: make demo-revoke NAME=ce1.localhost"; exit 2; }
+	@$(DEMO) cli registrar revoke $(NAME)
+
+demo-renew: demo-build
+	@test -n "$(CE)" || { echo "usage: make demo-renew CE=ce1"; exit 2; }
+	@$(DEMO) cli $(CE) renew
+
+demo-request: demo-build
+	@test -n "$(CE)" || { echo "usage: make demo-request CE=ce1"; exit 2; }
+	@$(DEMO) cli $(CE) request --approval
+
+demo-approve: demo-build
+	@test -n "$(CODE)" || { echo "usage: make demo-approve CODE=XXXX-XXXX"; exit 2; }
+	@$(DEMO) cli registrar approve $(CODE)
+
+demo-advertise: demo-build
+	@test -n "$(CE)" -a -n "$(NAME)" || { echo "usage: make demo-advertise CE=ce1 NAME=ce2.localhost"; exit 2; }
+	@$(DEMO) advertise $(CE) $(NAME)
+
+demo-clean:
+	rm -rf $(DEMO_DIR)
 
 # --- RPM packaging -------------------------------------------------------
 

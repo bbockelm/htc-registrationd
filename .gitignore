@@ -23,3 +23,6 @@ coverage.*
 # the RPM to dist/.
 /dist/
 /packaging/staging/
+
+# `make demo` state
+/.demo/

@@ -49,6 +49,57 @@ symlink, and two configuration files in `/etc/condor-ce/config.d/`:
 starts nothing: enable the daemon by uncommenting the `DAEMON_LIST` and
 `HTC_REGISTRATIOND_MODE` lines in one of the two.
 
+## Demo
+
+`make demo` runs the whole system on one machine (macOS or Linux) as the
+current user, with no root and no system changes:
+
+- a registrar, with its web UI at `http://localhost:<port>`;
+- an OpenID provider whose login page offers four identities: `alice` may
+  approve `ce2.localhost`, `bob` may approve `ce1.localhost`, `admin` is a
+  registrar administrator, and `mallory` may approve nothing;
+- `ce1.localhost`, in callback mode, which registers by itself;
+- `ce2.localhost`, in approval mode, which waits for someone to approve it in
+  the web UI;
+- when HTCondor is installed (`condor_collector` on `PATH`, or `CONDOR_BIN`
+  naming its `sbin` directory), a `condor_collector` set up as an
+  HTCondor-CE CE-Collector: it verifies tokens with the registrar's signing
+  key and enforces HTCondor-CE's `COLLECTOR_REQUIREMENTS`, so a Scheduler ad's
+  `Name` must be the CE name its token authenticates. The demo advertises
+  each CE's Scheduler ad with the CE's token, and an ad that claims
+  `ce2.localhost` with ce1's token, which the collector rejects.
+
+When everything is up, the demo prints the URLs, ce2's approval URL and the
+commands to try, then streams every process's log. Ctrl-C stops it.
+
+```
+make demo                              # start; Ctrl-C stops
+make demo-status                       # both CEs' state and the registrar's list
+make demo-revoke NAME=ce1.localhost    # revoke a registration
+make demo-renew CE=ce1                 # renew a CE's token now
+make demo-request CE=ce1               # start an approval request on a CE
+make demo-approve CODE=XXXX-XXXX       # approve on the command line
+make demo-advertise CE=ce1 NAME=ce2.localhost  # advertise with a CE's token
+make demo-clean                        # remove all demo state
+CONDOR_BIN=/path/to/release_dir/sbin make demo   # use this HTCondor
+```
+
+All state is in `.demo/`: a throw-away CA and certificates, each daemon's
+`condor_config`, logs and spool, the signing key, and the installed tokens.
+It survives a restart; `make demo-clean` removes it. The `*.localhost` names
+resolve to loopback without configuration (RFC 6761), and certificates are
+still verified against them. Ports are chosen once, between 20000 and 30000,
+and kept in `.demo/ports.json`.
+
+The daemons run without a master, each listening on its own port. The demo
+answers each CE's `DC_RECONFIG_FULL` in the master's place, and then
+advertises that CE's Scheduler ad with the new token.
+
+`go test ./internal/demo/...` runs the demo headless, approves ce2 through
+the web UI and the identity provider as a browser would, and checks that
+both CEs install tokens the registrar's key verifies, and, with HTCondor
+installed, what the collector accepts.
+
 ## Running under the master
 
 The daemon must be a DaemonCore daemon to the master
