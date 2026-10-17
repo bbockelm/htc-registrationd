@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"slices"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -31,7 +32,11 @@ On the CE:
 
 On the registrar:
   list                   list requests and registrations
-  approve CODE           approve a pending request by user code (or request number)
+  approve CODE NAME [--replace]
+                         approve a pending request by user code (or request
+                         number); NAME is the CE the request must be for.
+                         --replace approves a name that already has an active
+                         registration, revoking its approval-mode ones
   deny CODE [REASON]     deny a pending request
   revoke NAME [REASON]   revoke every registration of NAME
   revoke --id ID [REASON] revoke one registration
@@ -105,15 +110,28 @@ func (c *cli) dispatch(args []string) error {
 		if len(rest) == 0 {
 			return fmt.Errorf("%s needs a user code or request number", cmd)
 		}
-		t := &protocol.AdminTarget{UserCode: rest[0], Reason: reason(1)}
+		t := &protocol.AdminTarget{UserCode: rest[0]}
 		var n int64
 		if _, err := fmt.Sscanf(rest[0], "%d", &n); err == nil && n > 0 {
-			t = &protocol.AdminTarget{RequestNumber: n, Reason: reason(1)}
+			t = &protocol.AdminTarget{RequestNumber: n}
 		}
-		if cmd == "approve" {
-			return c.simple(protocol.RegAdminApprove, t)
+		if cmd == "deny" {
+			t.Reason = reason(1)
+			return c.simple(protocol.RegAdminDeny, t)
 		}
-		return c.simple(protocol.RegAdminDeny, t)
+		var args []string
+		for _, a := range rest[1:] {
+			if a == "--replace" {
+				t.Replace = true
+				continue
+			}
+			args = append(args, a)
+		}
+		if len(args) != 1 || strings.HasPrefix(args[0], "-") {
+			return fmt.Errorf("usage: approve CODE NAME [--replace]: NAME is the CE name the request must carry")
+		}
+		t.Name = strings.ToLower(args[0])
+		return c.simple(protocol.RegAdminApprove, t)
 	case "revoke":
 		if len(rest) == 0 {
 			return fmt.Errorf("revoke needs a name or --id ID")
@@ -124,7 +142,7 @@ func (c *cli) dispatch(args []string) error {
 			}
 			return c.simple(protocol.RegAdminRevoke, &protocol.AdminTarget{RegistrationID: rest[1], Reason: reason(2)})
 		}
-		return c.simple(protocol.RegAdminRevoke, &protocol.AdminTarget{Name: rest[0], Reason: reason(1)})
+		return c.simple(protocol.RegAdminRevoke, &protocol.AdminTarget{Name: strings.ToLower(rest[0]), Reason: reason(1)})
 	}
 	return fmt.Errorf("unknown command %q", cmd)
 }
@@ -142,6 +160,11 @@ func (c *cli) connect(ctx context.Context, cmd int) (*client.HTCondorClient, err
 		sc.Authentication = security.SecurityRequired
 	} else if sc.Authentication == security.SecurityOptional {
 		sc.Authentication = security.SecurityPreferred
+	}
+	// The registrar requires encryption for its administration commands.
+	if slices.Contains(protocol.AdminCommands, cmd) {
+		sc.Encryption = security.SecurityRequired
+		sc.Integrity = security.SecurityRequired
 	}
 	cl, err := client.ConnectAndAuthenticate(ctx, c.addr, sc)
 	if err != nil {

@@ -54,7 +54,6 @@ const (
 	AttrMethod                  = "Method"
 	AttrCallbackAddress         = "CallbackAddress"
 	AttrNonce                   = "Nonce"
-	AttrLimits                  = "Limits"
 	AttrCEVersion               = "CEVersion"
 	AttrRequestID               = "RequestId"
 	AttrUserCode                = "UserCode"
@@ -91,7 +90,6 @@ type Request struct {
 	Method          string `ad:"Method"`
 	CallbackAddress string `ad:"CallbackAddress"`
 	Nonce           string `ad:"Nonce"`
-	Limits          string `ad:"Limits"`
 	CEVersion       string `ad:"CEVersion"`
 }
 
@@ -178,13 +176,16 @@ type Ack struct {
 }
 
 // AdminTarget names what an admin command acts on. Approve and deny take a
-// UserCode or RequestNumber; revoke takes a RegistrationId or a Name (all of
-// that name's active registrations).
+// UserCode or RequestNumber; approve also takes the Name the request must
+// carry, and Replace to approve a name that already has an active
+// registration. Revoke takes a RegistrationId or a Name (all of that name's
+// active registrations).
 type AdminTarget struct {
 	UserCode       string `ad:"UserCode"`
 	RequestNumber  int64  `ad:"RequestNumber"`
 	RegistrationID string `ad:"RegistrationId"`
 	Name           string `ad:"Name"`
+	Replace        bool   `ad:"Replace"`
 	Reason         string `ad:"Reason"`
 }
 

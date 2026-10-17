@@ -42,12 +42,12 @@ func TestCallbackDialRefusedByHook(t *testing.T) {
 	policy := ssrf.New(nil)
 	policy.LocalAddrs = func() ([]netip.Addr, error) { return nil, nil }
 	svc, err := New(Config{
-		Minter:                 f.minter,
-		SSRF:                   policy,
-		Names:                  AnyName{},
-		CallbackSecurity:       func() *security.SecurityConfig { return &security.SecurityConfig{} },
-		CallbackConnectTimeout: 5 * time.Second,
-		Now:                    f.clock.Now,
+		Minter:           f.minter,
+		SSRF:             policy,
+		Names:            AnyName{},
+		CallbackSecurity: func() *security.SecurityConfig { return &security.SecurityConfig{} },
+		Tunables:         Tunables{CallbackConnectTimeout: 5 * time.Second},
+		Now:              f.clock.Now,
 	}, f.store)
 	if err != nil {
 		t.Fatal(err)

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/bbockelm/cedar/client"
@@ -38,7 +37,7 @@ func (s *Service) dialCallback(ctx context.Context, target *ssrf.Target, name st
 	ccfg := &client.ClientConfig{
 		Address:     target.Dial,
 		Security:    sc,
-		Timeout:     s.cfg.CallbackConnectTimeout,
+		Timeout:     s.t().CallbackConnectTimeout,
 		ClientName:  "htc-registrationd",
 		DialControl: s.cfg.SSRF.Control,
 	}
@@ -49,64 +48,95 @@ func (s *Service) dialCallback(ctx context.Context, target *ssrf.Target, name st
 	return &callbackConn{st: cl.GetStream(), close: cl.Close}, nil
 }
 
-func (s *Service) nameBackedOff(name string) (time.Duration, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	b, ok := s.backoff[name]
-	if !ok {
-		return 0, false
-	}
-	if left := b.until.Sub(s.cfg.Now()); left > 0 {
-		return left, true
-	}
-	return 0, false
+// callbackKeyFor is the back-off and in-flight key of a callback for name
+// requested from src.
+func callbackKeyFor(name, src string) callbackKey {
+	return callbackKey{name: name, net: SourceNet(src)}
 }
 
-func (s *Service) recordCallback(name string, ok bool) {
+// backedOff reports whether callbacks for k are backing off.
+func (s *Service) backedOff(k callbackKey) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	b, ok := s.backoff[k]
+	return ok && s.cfg.Now().Before(b.until)
+}
+
+// recordCallback records a callback's outcome. A failure backs off further
+// requests for the name from the same network only; a success, which proves
+// the requester is the name's CE, clears the back-off of every network for
+// the name.
+func (s *Service) recordCallback(k callbackKey, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.cfg.Now()
 	if ok {
-		delete(s.backoff, name)
+		for bk := range s.backoff {
+			if bk.name == k.name {
+				delete(s.backoff, bk)
+			}
+		}
 		return
 	}
-	b := s.backoff[name]
+	t := s.t()
+	b := s.backoff[k]
 	b.failures++
-	d := s.cfg.CallbackBackoff
-	for i := 1; i < b.failures && d < s.cfg.CallbackBackoffMax; i++ {
+	d := t.CallbackBackoff
+	for i := 1; i < b.failures && d < t.CallbackBackoffMax; i++ {
 		d *= 2
 	}
-	if d > s.cfg.CallbackBackoffMax {
-		d = s.cfg.CallbackBackoffMax
+	if d > t.CallbackBackoffMax {
+		d = t.CallbackBackoffMax
 	}
-	b.until = s.cfg.Now().Add(d)
-	s.backoff[name] = b
+	b.until = now.Add(d)
+	s.backoff[k] = b
+	// Drop entries whose back-off ended long ago, so the map stays bounded
+	// by the requests of the last CallbackBackoffMax.
+	for bk, bb := range s.backoff {
+		if now.Sub(bb.until) > t.CallbackBackoffMax {
+			delete(s.backoff, bk)
+		}
+	}
 }
 
-func (s *Service) claimInflight(name string) bool {
+func (s *Service) claimInflight(k callbackKey) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.inflight[name] {
+	if s.inflight[k] {
 		return false
 	}
-	s.inflight[name] = true
+	s.inflight[k] = true
 	return true
 }
 
-func (s *Service) releaseInflight(name string) {
+func (s *Service) releaseInflight(k callbackKey) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.inflight, name)
+	delete(s.inflight, k)
 }
+
+// errCallbackDial is what a requester is told when the callback could not
+// connect or the TLS handshake failed. The detail (connection refused, a
+// timeout, a certificate for another name) goes to the registrar's log only:
+// told to a requester, it would make the registrar a port prober.
+var errCallbackDial = errors.New("the registrar could not connect to the callback address and verify " +
+	"its certificate for the requested name; the registrar's log has the detail")
 
 // requestCallback handles a callback-mode REG_REQUEST. The
 // reply carries the RequestId; the registrar then dials the CE, and a second
 // reply on this connection reports the outcome. The token itself only ever
 // travels on the callback connection.
+//
+// Back-off after a failure and the one-callback-at-a-time slot are charged to
+// the name and the requesting network together: an anonymous requester that
+// fails callbacks for a name slows only itself, never the name's own CE. The
+// pending-request caps bound how fast any one network can probe.
 func (s *Service) requestCallback(ctx context.Context, c *cedarserver.Conn, req *protocol.Request, src string) error {
 	name := req.Name
-	if left, ok := s.nameBackedOff(name); ok {
+	key := callbackKeyFor(name, src)
+	if s.backedOff(key) {
 		return s.refuse(ctx, c, protocol.Err(protocol.ErrRateLimited,
-			"a recent callback to %s failed; retry in %s", name, left.Round(time.Second)))
+			"a recent callback for %s requested from this network failed; try again later", name))
 	}
 	revoked, err := s.store.NameRevoked(ctx, name)
 	if err != nil {
@@ -130,17 +160,18 @@ func (s *Service) requestCallback(ctx context.Context, c *cedarserver.Conn, req 
 			"address", req.CallbackAddress, "err", err)
 		return s.refuse(ctx, c, protocol.Err(protocol.ErrCallbackDenied, "%v", err))
 	}
-	if !s.claimInflight(name) {
-		return s.refuse(ctx, c, protocol.Err(protocol.ErrRateLimited, "a callback to %s is already in progress", name))
+	if !s.claimInflight(key) {
+		return s.refuse(ctx, c, protocol.Err(protocol.ErrRateLimited, "a callback for %s is already in progress", name))
 	}
-	defer s.releaseInflight(name)
+	defer s.releaseInflight(key)
 
+	t := s.t()
 	requestID, err := secret.NewID()
 	if err != nil {
 		return s.refuse(ctx, c, protocol.Err(protocol.ErrInternal, "internal error"))
 	}
 	nonceHash := secret.Hash(req.Nonce)
-	number, err := s.store.CreateRequest(ctx, NewRequest{
+	number, err := s.createRequest(ctx, c, NewRequest{
 		RequestIDHash:   secret.Hash(requestID),
 		NonceHash:       nonceHash,
 		Name:            name,
@@ -149,11 +180,10 @@ func (s *Service) requestCallback(ctx context.Context, c *cedarserver.Conn, req 
 		CallbackAddress: req.CallbackAddress,
 		CEVersion:       req.CEVersion,
 		Status:          ReqCallbackPending,
-		TTL:             s.cfg.CallbackTimeout + s.cfg.CallbackConnectTimeout,
+		TTL:             t.CallbackTimeout + t.CallbackConnectTimeout,
 	})
 	if err != nil {
-		s.log.Error("registrar: recording callback request", "err", err)
-		return s.refuse(ctx, c, protocol.Err(protocol.ErrInternal, "registrar database error"))
+		return err // already refused
 	}
 	if err := protocol.Send(ctx, c.Stream, &protocol.RequestReply{
 		Status: protocol.StatusCallbackPending, RequestID: requestID,
@@ -163,29 +193,43 @@ func (s *Service) requestCallback(ctx context.Context, c *cedarserver.Conn, req 
 	}
 
 	regID, cerr := s.runCallback(ctx, number, name, src, requestID, nonceHash, target)
-	s.recordCallback(name, cerr == nil)
+	s.recordCallback(key, cerr == nil)
 	outcome := protocol.CallbackOutcome{Status: protocol.StatusIssued}
 	if cerr != nil {
 		reason := cerr.Error()
-		s.log.Warn("registrar: callback failed", "request", number, "name", name, "address", target.Dial, "err", reason)
+		s.log.Warn("registrar: callback failed", "request", number, "name", name, "address", target.Dial,
+			"source", src, "err", reason)
 		_ = s.store.FinishRequest(ctx, number, ReqFailed, reason, regID)
+		told := reason
+		var de *dialError
+		if errors.As(cerr, &de) {
+			told = errCallbackDial.Error()
+		}
 		outcome = protocol.CallbackOutcome{Status: protocol.StatusFailed,
-			Error: protocol.Error{Code: protocol.ErrCallbackFailed, Message: reason}}
+			Error: protocol.Error{Code: protocol.ErrCallbackFailed, Message: told}}
 	}
 	return protocol.Send(ctx, c.Stream, &outcome)
 }
 
+// dialError is a callback that failed before the CE was authenticated.
+type dialError struct{ err error }
+
+func (e *dialError) Error() string { return e.err.Error() }
+func (e *dialError) Unwrap() error { return e.err }
+
 // runCallback performs REG_CALLBACK against the CE and returns the
 // registration id the token was issued under.
 func (s *Service) runCallback(ctx context.Context, number int64, name, src, requestID, nonceHash string, target *ssrf.Target) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, s.cfg.CallbackTimeout)
+	ctx, cancel := context.WithTimeout(ctx, s.t().CallbackTimeout)
 	defer cancel()
 	cc, err := s.dialCallback(ctx, target, name)
 	if err != nil {
-		return "", fmt.Errorf("callback to %s (as %s) failed: %w", target.Dial, name, err)
+		return "", &dialError{fmt.Errorf("callback to %s (as %s) failed: %w", target.Dial, name, err)}
 	}
 	defer func() { _ = cc.close() }()
 
+	// From here on the peer has proven it holds a certificate for name, so
+	// what went wrong is told to the requester.
 	if err := protocol.Send(ctx, cc.st, &protocol.CallbackHello{RequestID: requestID}); err != nil {
 		return "", fmt.Errorf("callback: sending RequestId: %w", err)
 	}

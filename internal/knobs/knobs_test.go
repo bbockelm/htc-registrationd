@@ -1,6 +1,7 @@
 package knobs
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -24,11 +25,11 @@ func TestTypedKnobs(t *testing.T) {
 	if d, _ := Duration(cfg, "UNSET", time.Second); d != time.Second {
 		t.Errorf("default: %v", d)
 	}
-	if b, err := Bool(cfg, "HTC_REGISTRATIOND_RECHECK", true); err != nil || b {
-		t.Errorf("bool: %v %v", b, err)
+	if b := Bool(cfg, "HTC_REGISTRATIOND_RECHECK", true); b {
+		t.Errorf("bool: %v", b)
 	}
-	if _, err := Bool(cfg, "BAD_BOOL", true); err == nil {
-		t.Error("bad bool accepted")
+	if b := Bool(cfg, "BAD_BOOL", true); !b {
+		t.Error("an invalid bool did not keep the default")
 	}
 	if n, err := Int(cfg, "HTC_REGISTRATIOND_MAX", 0); err != nil || n != 12 {
 		t.Errorf("int: %v %v", n, err)
@@ -84,3 +85,88 @@ func TestDefaultRegistrar(t *testing.T) {
 		}
 	}
 }
+
+// StringIsBooleanParam follows HTCondor's string_is_boolean_param.
+func TestStringIsBooleanParam(t *testing.T) {
+	cases := []struct {
+		in          string
+		def         bool
+		want, valid bool
+	}{
+		{"true", false, true, true},
+		{"TRUE", false, true, true},
+		{"True  ", false, true, true},
+		{"1", false, true, true},
+		{"false", true, false, true},
+		{"FaLsE\t", true, false, true},
+		{"0", true, false, true},
+		// Not literals, so ClassAd expressions.
+		{"2 > 1", false, true, true},
+		{"1 == 2", true, false, true},
+		{"10", false, true, true},
+		{"0.0", true, false, true},
+		{"(3 - 3)", true, false, true},
+		{"true && false", true, false, true},
+		// HTCondor rejects these, keeping the default.
+		{"yes", false, false, false},
+		{"on", false, false, false},
+		{"t", true, true, false},
+		{"off", true, true, false},
+		{`"true"`, false, false, false},
+		// An invalid value with a literal prefix yields the literal.
+		{"truex", false, true, false},
+		{"falsey", true, false, false},
+	}
+	for _, tc := range cases {
+		got, valid := StringIsBooleanParam(tc.in, tc.def)
+		if got != tc.want || valid != tc.valid {
+			t.Errorf("StringIsBooleanParam(%q, %v) = %v, %v; want %v, %v", tc.in, tc.def, got, valid, tc.want, tc.valid)
+		}
+	}
+}
+
+func TestCEName(t *testing.T) {
+	lookup := func(host string) (string, error) {
+		if host == "ce1" {
+			return "ce1.example.edu.", nil
+		}
+		return "", errNoSuchHost
+	}
+	cases := []struct {
+		name string
+		cfg  Map
+		want string
+		err  string
+	}{
+		{"explicit, lower-cased", Map{"HTC_REGISTRATIOND_NAME": "CE.Example.EDU"}, "ce.example.edu", ""},
+		{"no SCHEDD_NAME: the host", Map{"FULL_HOSTNAME": "ce1.example.edu"}, "ce1.example.edu", ""},
+		{"SCHEDD_NAME is the host", Map{"SCHEDD_NAME": "CE1.example.edu", "FULL_HOSTNAME": "ce1.example.edu"},
+			"ce1.example.edu", ""},
+		{"short SCHEDD_NAME resolving to the host", Map{"SCHEDD_NAME": "ce1", "FULL_HOSTNAME": "ce1.example.edu"},
+			"ce1.example.edu", ""},
+		{"short SCHEDD_NAME with DEFAULT_DOMAIN_NAME", Map{"SCHEDD_NAME": "ce2", "NO_DNS": "true",
+			"DEFAULT_DOMAIN_NAME": "example.edu", "FULL_HOSTNAME": "ce2.example.edu"}, "ce2.example.edu", ""},
+		{"another name becomes name@host", Map{"SCHEDD_NAME": "alias.example.edu", "FULL_HOSTNAME": "ce1.example.edu"},
+			"", "alias.example.edu@ce1.example.edu"},
+		{"a name with @ is kept, and refused", Map{"SCHEDD_NAME": "a@b.example.edu", "FULL_HOSTNAME": "ce1.example.edu"},
+			"", "a@b.example.edu"},
+		{"nothing", Map{}, "", "no name"},
+	}
+	for _, tc := range cases {
+		got, err := CEName(tc.cfg, lookup)
+		if tc.err != "" {
+			if err == nil || !strings.Contains(err.Error(), tc.err) {
+				t.Errorf("%s: %q, %v; want an error mentioning %q", tc.name, got, err, tc.err)
+			}
+			continue
+		}
+		if err != nil || got != tc.want {
+			t.Errorf("%s: %q, %v; want %q", tc.name, got, err, tc.want)
+		}
+	}
+	if got := BuildValidDaemonName(Map{}, "alias.example.edu", "ce1.example.edu", lookup); got != "alias.example.edu@ce1.example.edu" {
+		t.Errorf("BuildValidDaemonName: %q", got)
+	}
+}
+
+var errNoSuchHost = errors.New("no such host")

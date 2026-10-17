@@ -68,6 +68,14 @@ func (p TrustCEDARApprovers) StillAuthorized(ctx context.Context, approver Ident
 	return p.Backend.StillAuthorized(ctx, approver, name)
 }
 
+// NormalizeName is the form every CE name is stored and compared in: lower
+// case. Names are DNS names, which compare without regard to case (as
+// HTCondor's host-based authorization and TLS name checks do), so
+// CE.Example.EDU and ce.example.edu are one name: revoking either revokes
+// both. Every name is normalized where it enters (a request, an admin
+// command, the command line, configuration) and the store normalizes again.
+func NormalizeName(name string) string { return strings.ToLower(name) }
+
 // ValidName checks a requested CE name. It must equal the Scheduler ad's Name
 // (the collector requires Name == the authenticated user's name part), and in
 // callback mode it is a TLS server name, so it is held

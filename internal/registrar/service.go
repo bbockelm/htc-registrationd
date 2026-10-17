@@ -11,6 +11,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bbockelm/cedar/security"
@@ -30,26 +31,45 @@ type Config struct {
 	// Names decides which names callback mode may register.
 	Names NamePolicy
 	// Approvers re-checks approvers at renewal when RecheckApprover is set.
-	Approvers       ApproverPolicy
-	RecheckApprover bool
-	// MaxRegistrationAge caps a registration's age (0: no cap).
-	MaxRegistrationAge time.Duration
+	Approvers ApproverPolicy
 
 	// CallbackSecurity returns the base client security config for dialing a
 	// CE. The service forces SSL-only, required authentication and
 	// encryption, ServerName = the requested name and a private session cache
 	// on a copy of it.
 	CallbackSecurity func() *security.SecurityConfig
+
+	// Tunables are the settings a reconfig may change (Service.Reconfigure).
+	Tunables Tunables
+
+	Logger *slog.Logger
+	Now    func() time.Time
+}
+
+// Tunables are the registrar settings that take effect without a restart.
+type Tunables struct {
+	RecheckApprover bool
+	// MaxRegistrationAge caps a registration's age (0: no cap).
+	MaxRegistrationAge time.Duration
+	// RefreshIdleLifetime is how long a refresh secret stays usable after
+	// its registration's last successful issuance (default 30 days).
+	RefreshIdleLifetime time.Duration
+	// MaxReissues is how many consecutive renewals with the current refresh
+	// secret a registration may have before one more revokes it (default 5).
+	MaxReissues int
+
 	// CallbackConnectTimeout and CallbackTimeout bound the one callback attempt
 	// a request gets (defaults 10 s / 30 s).
 	CallbackConnectTimeout time.Duration
 	CallbackTimeout        time.Duration
-	// CallbackBackoff is the per-name back-off after a failed callback; it
-	// doubles per consecutive failure up to CallbackBackoffMax.
+	// CallbackBackoff is the back-off after a failed callback, per name and
+	// requesting network; it doubles per consecutive failure up to
+	// CallbackBackoffMax.
 	CallbackBackoff    time.Duration
 	CallbackBackoffMax time.Duration
 
-	// MaxPendingPerIP and MaxPending cap live requests.
+	// MaxPendingPerIP and MaxPending cap live requests, per requesting
+	// network (an IPv6 /64, an IPv4 address) and in total.
 	MaxPendingPerIP int
 	MaxPending      int
 
@@ -63,14 +83,18 @@ type Config struct {
 	// VerificationURI is where an administrator approves a request, e.g.
 	// https://registrar.example.org/approve.
 	VerificationURI string
-	// RequestRetention is how long finished requests are kept (default 7 d).
+	// RequestRetention is how long finished requests, and issued-token
+	// records past their expiry, are kept (default 7 d).
 	RequestRetention time.Duration
-
-	Logger *slog.Logger
-	Now    func() time.Time
 }
 
-func (c *Config) setDefaults() {
+func (c *Tunables) setDefaults() {
+	if c.RefreshIdleLifetime <= 0 {
+		c.RefreshIdleLifetime = 30 * 24 * time.Hour
+	}
+	if c.MaxReissues <= 0 {
+		c.MaxReissues = 5
+	}
 	if c.CallbackConnectTimeout <= 0 {
 		c.CallbackConnectTimeout = 10 * time.Second
 	}
@@ -101,6 +125,10 @@ func (c *Config) setDefaults() {
 	if c.RequestRetention <= 0 {
 		c.RequestRetention = 7 * 24 * time.Hour
 	}
+}
+
+func (c *Config) setDefaults() {
+	c.Tunables.setDefaults()
 	if c.Names == nil {
 		c.Names = AuthzNames{}
 	}
@@ -118,13 +146,19 @@ func (c *Config) setDefaults() {
 // Service serves the registrar's CEDAR commands.
 type Service struct {
 	cfg   Config
+	tun   atomic.Pointer[Tunables]
 	store *Store
 	log   *slog.Logger
 
 	mu       sync.Mutex
-	backoff  map[string]nameBackoff
-	inflight map[string]bool
+	backoff  map[callbackKey]nameBackoff
+	inflight map[callbackKey]bool
 }
+
+// callbackKey is what callback back-off and the in-flight slot are charged
+// to: a name and the network asking for it, so that a requester failing a
+// callback for a name never locks out the name's own CE.
+type callbackKey struct{ name, net string }
 
 type nameBackoff struct {
 	failures int
@@ -143,14 +177,27 @@ func New(cfg Config, store *Store) (*Service, error) {
 	if cfg.CallbackSecurity == nil {
 		return nil, errors.New("registrar: CallbackSecurity is required")
 	}
-	return &Service{
+	s := &Service{
 		cfg:      cfg,
 		store:    store,
 		log:      cfg.Logger,
-		backoff:  map[string]nameBackoff{},
-		inflight: map[string]bool{},
-	}, nil
+		backoff:  map[callbackKey]nameBackoff{},
+		inflight: map[callbackKey]bool{},
+	}
+	t := cfg.Tunables
+	s.tun.Store(&t)
+	return s, nil
 }
+
+// Reconfigure replaces the tunables; requests already in progress finish
+// under the old ones.
+func (s *Service) Reconfigure(t Tunables) {
+	t.setDefaults()
+	s.tun.Store(&t)
+}
+
+// t returns the current tunables.
+func (s *Service) t() *Tunables { return s.tun.Load() }
 
 // Store returns the service's store.
 func (s *Service) Store() *Store { return s.store }
@@ -171,7 +218,12 @@ func (s *Service) Maintain(ctx context.Context, every time.Duration) {
 	t := time.NewTicker(every)
 	defer t.Stop()
 	for {
-		if err := s.store.Maintain(ctx, s.cfg.RequestRetention); err != nil && ctx.Err() == nil {
+		tun := s.t()
+		if err := s.store.Maintain(ctx, MaintainOptions{
+			Retain:         tun.RequestRetention,
+			UnclaimedTTL:   tun.UnclaimedTTL,
+			TokenRetention: tun.RequestRetention,
+		}); err != nil && ctx.Err() == nil {
 			s.log.Error("registrar: store maintenance failed", "err", err)
 		}
 		select {
@@ -183,7 +235,7 @@ func (s *Service) Maintain(ctx context.Context, every time.Duration) {
 }
 
 // encrypted reports whether the session is encrypted; every REG_* command
-// that carries a secret refuses otherwise.
+// refuses otherwise.
 func encrypted(c *cedarserver.Conn) bool {
 	return c.Negotiation != nil && c.Negotiation.Encryption
 }
@@ -205,7 +257,7 @@ func (s *Service) refuse(ctx context.Context, c *cedarserver.Conn, perr *protoco
 }
 
 func (s *Service) handleRequest(ctx context.Context, c *cedarserver.Conn) error {
-	ctx, cancel := context.WithTimeout(ctx, handlerTimeout+s.cfg.CallbackTimeout)
+	ctx, cancel := context.WithTimeout(ctx, handlerTimeout+s.t().CallbackTimeout)
 	defer cancel()
 	if !encrypted(c) {
 		return s.refuse(ctx, c, protocol.Err(protocol.ErrNotEncrypted, "REG_REQUEST requires an encrypted session"))
@@ -214,6 +266,7 @@ func (s *Service) handleRequest(ctx context.Context, c *cedarserver.Conn) error 
 	if err := protocol.Recv(ctx, c.Stream, &req); err != nil {
 		return s.refuse(ctx, c, protocol.Err(protocol.ErrBadRequest, "bad request: %v", err))
 	}
+	req.Name = NormalizeName(req.Name)
 	if err := ValidName(req.Name); err != nil {
 		return s.refuse(ctx, c, protocol.Err(protocol.ErrBadRequest, "bad name: %v", err))
 	}
@@ -221,10 +274,6 @@ func (s *Service) handleRequest(ctx context.Context, c *cedarserver.Conn) error 
 		return s.refuse(ctx, c, protocol.Err(protocol.ErrBadRequest, "Nonce must be 32-512 characters"))
 	}
 	src := sourceIP(c.RemoteAddr)
-	if perr := s.checkCaps(ctx, src); perr != nil {
-		s.log.Warn("registrar: request refused by caps", "name", req.Name, "source", src, "reason", perr.Message)
-		return s.refuse(ctx, c, perr)
-	}
 	switch req.Method {
 	case protocol.MethodCallback:
 		return s.requestCallback(ctx, c, &req, src)
@@ -234,22 +283,26 @@ func (s *Service) handleRequest(ctx context.Context, c *cedarserver.Conn) error 
 	return s.refuse(ctx, c, protocol.Err(protocol.ErrBadRequest, "unknown Method %q", req.Method))
 }
 
-func (s *Service) checkCaps(ctx context.Context, src string) *protocol.Error {
-	perIP, total, err := s.store.CountPending(ctx, src)
-	if err != nil {
-		s.log.Error("registrar: counting pending requests", "err", err)
-		return protocol.Err(protocol.ErrInternal, "registrar database error")
+// createRequest records r under the pending-request caps, refusing on c when
+// they or the database say no.
+func (s *Service) createRequest(ctx context.Context, c *cedarserver.Conn, r NewRequest) (int64, error) {
+	t := s.t()
+	r.MaxPerSource, r.MaxTotal = t.MaxPendingPerIP, t.MaxPending
+	number, err := s.store.CreateRequest(ctx, r)
+	var capErr *CapError
+	if errors.As(err, &capErr) {
+		s.log.Warn("registrar: request refused by caps", "name", r.Name, "source", r.SourceIP, "reason", capErr.Error())
+		return 0, s.refuse(ctx, c, protocol.Err(protocol.ErrRateLimited, "%s", capErr.Error()))
 	}
-	if perIP >= s.cfg.MaxPendingPerIP {
-		return protocol.Err(protocol.ErrRateLimited, "too many pending requests from %s", src)
+	if err != nil && !errors.Is(err, ErrUserCodeTaken) {
+		s.log.Error("registrar: recording request", "err", err)
+		return 0, s.refuse(ctx, c, protocol.Err(protocol.ErrInternal, "registrar database error"))
 	}
-	if total >= s.cfg.MaxPending {
-		return protocol.Err(protocol.ErrRateLimited, "too many pending requests")
-	}
-	return nil
+	return number, err
 }
 
 func (s *Service) requestApproval(ctx context.Context, c *cedarserver.Conn, req *protocol.Request, src string) error {
+	t := s.t()
 	requestID, err := secret.NewID()
 	if err != nil {
 		return s.refuse(ctx, c, protocol.Err(protocol.ErrInternal, "internal error"))
@@ -260,7 +313,7 @@ func (s *Service) requestApproval(ctx context.Context, c *cedarserver.Conn, req 
 		if code, err = NewUserCode(); err != nil {
 			return s.refuse(ctx, c, protocol.Err(protocol.ErrInternal, "internal error"))
 		}
-		number, err = s.store.CreateRequest(ctx, NewRequest{
+		number, err = s.createRequest(ctx, c, NewRequest{
 			RequestIDHash: secret.Hash(requestID),
 			NonceHash:     secret.Hash(req.Nonce),
 			Name:          req.Name,
@@ -269,32 +322,34 @@ func (s *Service) requestApproval(ctx context.Context, c *cedarserver.Conn, req 
 			CEVersion:     req.CEVersion,
 			UserCode:      code,
 			Status:        ReqPending,
-			TTL:           s.cfg.ApprovalTTL,
-			PollInterval:  s.cfg.PollInterval,
+			TTL:           t.ApprovalTTL,
+			PollInterval:  t.PollInterval,
 		})
 		if errors.Is(err, ErrUserCodeTaken) && attempt < 5 {
 			continue
 		}
 		break
 	}
-	if err != nil {
-		s.log.Error("registrar: recording approval request", "err", err)
+	if errors.Is(err, ErrUserCodeTaken) {
 		return s.refuse(ctx, c, protocol.Err(protocol.ErrInternal, "registrar database error"))
+	}
+	if err != nil {
+		return err // already refused
 	}
 	reply := protocol.RequestReply{
 		Status:    protocol.StatusPending,
 		RequestID: requestID,
 		UserCode:  code,
-		Interval:  int64(s.cfg.PollInterval / time.Second),
-		ExpiresIn: int64(s.cfg.ApprovalTTL / time.Second),
+		Interval:  int64(t.PollInterval / time.Second),
+		ExpiresIn: int64(t.ApprovalTTL / time.Second),
 	}
-	if s.cfg.VerificationURI != "" {
-		reply.VerificationURI = s.cfg.VerificationURI
+	if t.VerificationURI != "" {
+		reply.VerificationURI = t.VerificationURI
 		sep := "?"
-		if strings.Contains(s.cfg.VerificationURI, "?") {
+		if strings.Contains(t.VerificationURI, "?") {
 			sep = "&"
 		}
-		reply.VerificationURIComplete = s.cfg.VerificationURI + sep + "code=" + code
+		reply.VerificationURIComplete = t.VerificationURI + sep + "code=" + code
 	}
 	s.log.Info("registrar: approval requested", "request", number, "name", req.Name, "code", code,
 		"source", src, "ce_version", req.CEVersion)
@@ -312,7 +367,7 @@ func (s *Service) handlePoll(ctx context.Context, c *cedarserver.Conn) error {
 		return s.refuse(ctx, c, protocol.Err(protocol.ErrBadRequest, "REG_POLL needs RequestId and Nonce"))
 	}
 	res, err := s.store.Poll(ctx, p.RequestID, p.Nonce, PollOptions{
-		UnclaimedTTL: s.cfg.UnclaimedTTL,
+		UnclaimedTTL: s.t().UnclaimedTTL,
 		SlowDownStep: 5 * time.Second,
 	}, s.cfg.Minter.Mint)
 	if errors.Is(err, ErrNotFound) {
@@ -346,17 +401,19 @@ func (s *Service) handleRenew(ctx context.Context, c *cedarserver.Conn) error {
 	if err := protocol.Recv(ctx, c.Stream, &r); err != nil || r.RegistrationID == "" || r.RefreshSecret == "" {
 		return s.refuse(ctx, c, protocol.Err(protocol.ErrBadRequest, "REG_RENEW needs RegistrationId and RefreshSecret"))
 	}
-	opts := RenewOptions{MaxAge: s.cfg.MaxRegistrationAge}
-	if s.cfg.RecheckApprover {
+	t := s.t()
+	opts := RenewOptions{MaxAge: t.MaxRegistrationAge, IdleLifetime: t.RefreshIdleLifetime, MaxReissues: t.MaxReissues}
+	if t.RecheckApprover {
 		opts.Recheck = s.cfg.Approvers.StillAuthorized
 	}
 	res, err := s.store.Renew(ctx, r.RegistrationID, r.RefreshSecret, opts, s.cfg.Minter.Mint)
 	var rerr *RenewError
 	if errors.As(err, &rerr) {
-		if res != nil && res.Action == RenewReuse {
-			s.log.Error("registrar: REFRESH SECRET REUSE: a superseded secret was presented; registration REVOKED "+
+		if res != nil && res.Registration.Status == RegRevoked {
+			s.log.Error("registrar: REFRESH SECRET MISUSE: registration REVOKED "+
 				"(possible theft of the CE's registration state)",
-				"registration", r.RegistrationID, "name", res.Registration.Name, "source", c.RemoteAddr)
+				"registration", r.RegistrationID, "name", res.Registration.Name, "source", c.RemoteAddr,
+				"reason", res.Registration.RevokeReason)
 		} else {
 			s.log.Warn("registrar: REG_RENEW refused", "registration", r.RegistrationID, "source", c.RemoteAddr,
 				"reason", rerr.Reason)
@@ -405,16 +462,26 @@ func (s *Service) findRequest(ctx context.Context, t *protocol.AdminTarget) (*Re
 }
 
 func (s *Service) handleAdminDecide(approve bool) cedarserver.HandlerFunc {
-	verb := "deny"
+	verb, cmd := "deny", "REG_ADMIN_DENY"
 	if approve {
-		verb = "approve"
+		verb, cmd = "approve", "REG_ADMIN_APPROVE"
 	}
 	return func(ctx context.Context, c *cedarserver.Conn) error {
 		ctx, cancel := context.WithTimeout(ctx, handlerTimeout)
 		defer cancel()
+		if !encrypted(c) {
+			return s.refuse(ctx, c, protocol.Err(protocol.ErrNotEncrypted, "%s requires an encrypted session", cmd))
+		}
 		var t protocol.AdminTarget
 		if err := protocol.Recv(ctx, c.Stream, &t); err != nil {
 			return s.refuse(ctx, c, protocol.Err(protocol.ErrBadRequest, "bad request: %v", err))
+		}
+		if approve && t.Name == "" {
+			// A user code alone approves whatever name the request carries,
+			// which is how a device-code phish works: the approver must say
+			// which CE they mean.
+			return s.refuse(ctx, c, protocol.Err(protocol.ErrBadRequest,
+				"approving needs the CE name the request is expected to carry"))
 		}
 		r, err := s.findRequest(ctx, &t)
 		if errors.Is(err, ErrNotFound) {
@@ -424,24 +491,44 @@ func (s *Service) handleAdminDecide(approve bool) cedarserver.HandlerFunc {
 			return s.refuse(ctx, c, protocol.Err(protocol.ErrBadRequest, "%v", err))
 		}
 		who := approverIdentity(c)
-		if err := s.store.Decide(ctx, r.Number, approve, who, t.Reason); err != nil {
+		var opts DecideOptions
+		if approve {
+			opts = DecideOptions{ExpectName: t.Name, RefuseActive: true, Replace: t.Replace}
+		}
+		replaced, err := s.store.DecideChecked(ctx, r.Number, approve, who, t.Reason, opts)
+		if err != nil {
+			var mismatch *NameMismatchError
+			if errors.As(err, &mismatch) {
+				s.log.Warn("registrar: approval refused: the request is for another name", "request", r.Number,
+					"name", r.Name, "expected", mismatch.Expected, "by", who.String())
+			}
 			return s.refuse(ctx, c, protocol.Err(protocol.ErrBadRequest, "cannot %s request %d: %v", verb, r.Number, err))
 		}
+		for _, reg := range replaced {
+			s.log.Warn("registrar: registration revoked: replaced", "registration", reg.ID, "name", reg.Name,
+				"request", r.Number, "by", who.String())
+		}
 		s.log.Info("registrar: request "+verb+"d", "request", r.Number, "name", r.Name, "code", r.UserCode, "by", who.String())
-		return protocol.Send(ctx, c.Stream, &protocol.Ack{Status: protocol.StatusOK,
-			Hint: fmt.Sprintf("request %d (%s) %sd", r.Number, r.Name, verb)})
+		hint := fmt.Sprintf("request %d (%s) %sd", r.Number, r.Name, verb)
+		if len(replaced) > 0 {
+			hint += fmt.Sprintf("; revoked %d earlier approval-mode registration(s) of %s", len(replaced), r.Name)
+		}
+		return protocol.Send(ctx, c.Stream, &protocol.Ack{Status: protocol.StatusOK, Hint: hint})
 	}
 }
 
 func (s *Service) handleAdminRevoke(ctx context.Context, c *cedarserver.Conn) error {
 	ctx, cancel := context.WithTimeout(ctx, handlerTimeout)
 	defer cancel()
+	if !encrypted(c) {
+		return s.refuse(ctx, c, protocol.Err(protocol.ErrNotEncrypted, "REG_ADMIN_REVOKE requires an encrypted session"))
+	}
 	var t protocol.AdminTarget
 	if err := protocol.Recv(ctx, c.Stream, &t); err != nil {
 		return s.refuse(ctx, c, protocol.Err(protocol.ErrBadRequest, "bad request: %v", err))
 	}
 	who := approverIdentity(c)
-	revoked, err := s.store.Revoke(ctx, t.RegistrationID, t.Name, who, t.Reason)
+	revoked, err := s.store.Revoke(ctx, t.RegistrationID, NormalizeName(t.Name), who, t.Reason)
 	if errors.Is(err, ErrNotFound) {
 		return s.refuse(ctx, c, protocol.Err(protocol.ErrNotFound, "no active registration matches"))
 	}
@@ -462,7 +549,10 @@ func (s *Service) handleAdminRevoke(ctx context.Context, c *cedarserver.Conn) er
 func (s *Service) handleAdminList(ctx context.Context, c *cedarserver.Conn) error {
 	ctx, cancel := context.WithTimeout(ctx, handlerTimeout)
 	defer cancel()
-	reqs, err := s.store.ListRequests(ctx, s.cfg.Now().Add(-s.cfg.RequestRetention))
+	if !encrypted(c) {
+		return s.refuse(ctx, c, protocol.Err(protocol.ErrNotEncrypted, "REG_ADMIN_LIST requires an encrypted session"))
+	}
+	reqs, err := s.store.ListRequests(ctx, s.cfg.Now().Add(-s.t().RequestRetention))
 	if err != nil {
 		return s.refuse(ctx, c, protocol.Err(protocol.ErrInternal, "registrar database error"))
 	}
