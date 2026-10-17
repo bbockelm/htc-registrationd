@@ -18,7 +18,7 @@
 </nav>
 {{- end}}
 </header>
-<main>
+<main{{if .Wide}} class="wide"{{end}}>
 {{template "content" .}}
 </main>
 {{- if .User}}

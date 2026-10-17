@@ -180,6 +180,14 @@ test('admin sees every registration and revokes ce1', async ({ page, demo }) => 
   await expect(ce1Row).toContainText('active');
   await expect(ce2Row).toContainText('alice');
 
+  // On a wide window the whole table fits: no sideways scrolling to reach Revoke.
+  await page.setViewportSize({ width: 1280, height: 800 });
+  const overflow = await page.locator('.scroll').evaluate((el) => el.scrollWidth - el.clientWidth);
+  expect(overflow).toBeLessThanOrEqual(0);
+  const revoke = await ce1Row.getByRole('button', { name: 'Revoke' }).boundingBox();
+  expect(revoke).not.toBeNull();
+  expect(revoke!.x + revoke!.width).toBeLessThanOrEqual(1280);
+
   await ce1Row.getByRole('button', { name: 'Revoke' }).click();
   await atRegistrar(page, demo, '/registrations');
   await expect(page.getByText(/Revoked the registration of ce1\.localhost\./)).toBeVisible();

@@ -560,6 +560,7 @@ func (s *Server) handleRegistrations(w http.ResponseWriter, r *http.Request) {
 	}
 	admin := s.cfg.Authz.IsAdmin(sess.Principal)
 	page := registrationsPage{base: s.base(r, "Registrations")}
+	page.Wide = true
 	for _, reg := range regs {
 		acc := s.accessTo(r.Context(), sess, admin, reg)
 		if !acc.see {
