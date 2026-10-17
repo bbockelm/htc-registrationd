@@ -10,7 +10,6 @@
 package ssrf
 
 import (
-	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -33,12 +32,6 @@ func (e *DeniedError) Error() string {
 	return fmt.Sprintf("callback address %s is not allowed: %s", e.Addr, e.Reason)
 }
 
-// ErrDenied matches every *DeniedError with errors.Is.
-var ErrDenied = errors.New("callback address denied")
-
-// Is lets errors.Is(err, ErrDenied) match.
-func (e *DeniedError) Is(target error) bool { return target == ErrDenied }
-
 type deniedRange struct {
 	prefix netip.Prefix
 	reason string
@@ -59,17 +52,24 @@ var deniedV4 = mustRanges(
 	"10.0.0.0/8", "private (RFC 1918)",
 	"100.64.0.0/10", "carrier-grade NAT (RFC 6598)",
 	"127.0.0.0/8", "loopback",
+	"168.63.129.16/32", "cloud platform service address (Azure WireServer)",
 	"169.254.0.0/16", "link-local",
 	"172.16.0.0/12", "private (RFC 1918)",
+	"192.0.0.0/24", "IETF protocol assignments (RFC 6890)",
+	"192.0.2.0/24", "documentation (RFC 5737)",
 	"192.168.0.0/16", "private (RFC 1918)",
+	"198.18.0.0/15", "benchmarking (RFC 2544)",
+	"198.51.100.0/24", "documentation (RFC 5737)",
+	"203.0.113.0/24", "documentation (RFC 5737)",
 	"224.0.0.0/4", "multicast",
 	"240.0.0.0/4", "reserved / broadcast",
 )
 
 // deniedV6 are the IPv6 ranges denied by default. ::/96 (deprecated
 // IPv4-compatible addresses, which also covers :: and ::1), the local-use
-// NAT64 prefix and Teredo are refused outright; ::ffff:0:0/96, 64:ff9b::/96
-// and 2002::/16 embed an IPv4 address that is checked on its own instead.
+// NAT64 prefix and Teredo are refused outright; ::ffff:0:0/96,
+// ::ffff:0:0:0/96 (SIIT), 64:ff9b::/96 and 2002::/16 embed an IPv4 address
+// that is checked on its own instead.
 var deniedV6 = mustRanges(
 	"::/128", "unspecified",
 	"::1/128", "loopback",
@@ -77,6 +77,7 @@ var deniedV6 = mustRanges(
 	"100::/64", "discard-only (RFC 6666)",
 	"64:ff9b:1::/48", "local-use NAT64 (RFC 8215)",
 	"2001::/32", "Teredo",
+	"2001:db8::/32", "documentation (RFC 3849)",
 	"fc00::/7", "unique local (ULA)",
 	"fe80::/10", "link-local",
 	"fec0::/10", "site-local (deprecated)",
@@ -85,6 +86,7 @@ var deniedV6 = mustRanges(
 
 var (
 	nat64WellKnown = netip.MustParsePrefix("64:ff9b::/96")
+	siit           = netip.MustParsePrefix("::ffff:0:0:0/96")
 	sixToFour      = netip.MustParsePrefix("2002::/16")
 )
 
@@ -160,7 +162,8 @@ func InterfaceAddrs() ([]netip.Addr, error) {
 }
 
 // embeddedV4 returns the IPv4 address an IPv6 address carries in its
-// IPv4-mapped, NAT64 (64:ff9b::/96) or 6to4 (2002::/16) form.
+// IPv4-mapped, SIIT IPv4-translated (::ffff:0:0:0/96), NAT64 (64:ff9b::/96)
+// or 6to4 (2002::/16) form.
 func embeddedV4(a netip.Addr) (netip.Addr, bool) {
 	if a.Is4In6() {
 		return a.Unmap(), true
@@ -169,7 +172,7 @@ func embeddedV4(a netip.Addr) (netip.Addr, bool) {
 		return netip.Addr{}, false
 	}
 	b := a.As16()
-	if nat64WellKnown.Contains(a) {
+	if nat64WellKnown.Contains(a) || siit.Contains(a) {
 		return netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}), true
 	}
 	if sixToFour.Contains(a) {
@@ -270,17 +273,12 @@ type Target struct {
 	// address the CE sent: a host name in it is resolved by cedar at dial
 	// time, and Control checks whatever address that yields.
 	Dial string
-	// Host is the host portion of the sinful.
-	Host string
 }
 
 // SinfulError reports a sinful refused for its form rather than its address.
 type SinfulError struct{ Reason string }
 
 func (e *SinfulError) Error() string { return "callback address refused: " + e.Reason }
-
-// Is lets errors.Is(err, ErrDenied) match.
-func (e *SinfulError) Is(target error) bool { return target == ErrDenied }
 
 // CheckSinful validates a callback sinful before any request is recorded. It
 // refuses CCB contacts and private-network parts, which would route the
@@ -332,7 +330,7 @@ func (p *Policy) CheckSinful(raw string) (*Target, error) {
 	if !strings.HasPrefix(dial, "<") {
 		dial = "<" + dial + ">"
 	}
-	return &Target{Dial: dial, Host: info.Host}, nil
+	return &Target{Dial: dial}, nil
 }
 
 // parseAddrsEntry parses one entry of a sinful's addrs= list: "a.b.c.d-port"
