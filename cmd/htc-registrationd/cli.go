@@ -26,7 +26,8 @@ const cliUsage = `usage: htc-registration [-addr SINFUL] [-debug] <command> [arg
 On the CE:
   status                 show this CE's registration state (REG_STATUS, READ)
   renew                  renew now (REG_RENEW_NOW, ADMINISTRATOR)
-  request --approval     not yet implemented; set HTC_REGISTRATIOND_METHOD = approval
+  request --approval     start an approval request now; print its URL and code
+                         (REG_REQUEST_APPROVAL, ADMINISTRATOR)
 
 On the registrar:
   list                   list requests and registrations
@@ -94,7 +95,10 @@ func (c *cli) dispatch(args []string) error {
 	case "renew":
 		return c.simple(protocol.RegRenewNow, nil)
 	case "request":
-		return fmt.Errorf("request is not implemented yet; set HTC_REGISTRATIOND_METHOD = approval and run renew")
+		if len(rest) != 1 || rest[0] != "--approval" {
+			return fmt.Errorf("usage: request --approval")
+		}
+		return c.simple(protocol.RegRequestApproval, nil)
 	case "list":
 		return c.list()
 	case "approve", "deny":

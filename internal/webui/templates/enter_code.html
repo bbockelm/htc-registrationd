@@ -1,0 +1,12 @@
+{{define "content"}}
+<h1>Approve a CE</h1>
+<p>Enter the code your CE shows.</p>
+{{- if .Error}}
+<p class="notice bad">{{.Error}}</p>
+{{- end}}
+<form method="get" action="/approve" class="code-entry">
+<label for="code">Code</label>
+<input id="code" name="code" value="{{.Code}}" placeholder="XXXX-XXXX" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="16" required autofocus>
+<button type="submit" class="primary">Continue</button>
+</form>
+{{end}}

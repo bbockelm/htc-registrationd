@@ -828,3 +828,25 @@ func (p *pair) statusCall() *StatusReply {
 	}
 	return &s
 }
+
+// TestRequestApprovalOverridesCallback: a CE configured for callback starts
+// an approval request when asked to, and reports its URL.
+func TestRequestApprovalOverridesCallback(t *testing.T) {
+	p := newPair(t, pairOptions{method: MethodCallback})
+	done := p.mgr.RequestApproval()
+	p.step()
+	if err := <-done; err != nil {
+		t.Fatalf("forced approval request: %v", err)
+	}
+	st := p.mgr.State()
+	if st.RequestID == "" || st.Method != MethodApproval {
+		t.Fatalf("no approval request: %+v", st)
+	}
+	reqs, _ := p.store.ListRequests(context.Background(), time.Time{})
+	if len(reqs) != 1 || reqs[0].Method != protocol.MethodApproval || reqs[0].UserCode != st.UserCode {
+		t.Fatalf("requests %+v", reqs)
+	}
+	if s := p.mgr.Status(); s.ApprovalURL != "https://registrar.test/approve?code="+st.UserCode {
+		t.Fatalf("status %+v", s)
+	}
+}

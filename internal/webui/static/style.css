@@ -1,0 +1,119 @@
+:root {
+  --bg: #ffffff;
+  --fg: #1d2129;
+  --muted: #5f6672;
+  --line: #dde1e6;
+  --panel: #f6f7f9;
+  --accent: #1f5fbf;
+  --accent-fg: #ffffff;
+  --good-bg: #e8f5ec;
+  --good-line: #8cc79f;
+  --bad-bg: #fbeceb;
+  --bad-line: #e3a29c;
+  --danger: #b3261e;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #15181d;
+    --fg: #e4e7ec;
+    --muted: #9aa3ae;
+    --line: #2e343c;
+    --panel: #1d2127;
+    --accent: #5b9bf0;
+    --accent-fg: #0d1117;
+    --good-bg: #16291d;
+    --good-line: #2f6b43;
+    --bad-bg: #2d1817;
+    --bad-line: #7a3631;
+    --danger: #f2827a;
+  }
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+header.top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem 1.5rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--line);
+}
+.brand { font-weight: 600; color: var(--fg); text-decoration: none; }
+nav { display: flex; flex-wrap: wrap; align-items: center; gap: 1rem; }
+nav a { color: var(--accent); text-decoration: none; }
+nav a:hover { text-decoration: underline; }
+main { max-width: 56rem; margin: 0 auto; padding: 1.5rem 1rem 3rem; }
+h1 { font-size: 1.5rem; margin: 0 0 1rem; }
+a { color: var(--accent); }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.92em; overflow-wrap: anywhere; }
+.lead { font-size: 1.1rem; margin-bottom: 0.5rem; }
+.muted { color: var(--muted); }
+.code {
+  display: inline-block;
+  margin: 0 0 1.5rem;
+  padding: 0.6rem 1.2rem;
+  border: 2px solid var(--accent);
+  border-radius: 8px;
+  background: var(--panel);
+  font: 600 2.25rem/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: 0.12em;
+}
+dl.facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.4rem 1.25rem;
+  margin: 0 0 1.5rem;
+}
+dl.facts dt { color: var(--muted); }
+dl.facts dd { margin: 0; overflow-wrap: anywhere; }
+@media (max-width: 30rem) {
+  dl.facts { grid-template-columns: 1fr; }
+  dl.facts dd { margin-bottom: 0.5rem; }
+}
+.notice { padding: 0.75rem 1rem; border-radius: 6px; border: 1px solid; margin: 0 0 1rem; }
+.notice.good { background: var(--good-bg); border-color: var(--good-line); }
+.notice.bad { background: var(--bad-bg); border-color: var(--bad-line); }
+form.inline { display: inline; margin: 0; }
+form.actions { display: flex; flex-wrap: wrap; gap: 0.75rem; }
+form.code-entry { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; }
+form.code-entry input {
+  font: 600 1.4rem ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  width: 11ch;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+}
+button {
+  font: inherit;
+  cursor: pointer;
+  border-radius: 6px;
+  padding: 0.5rem 1.1rem;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--fg);
+}
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
+button.secondary { background: var(--bg); }
+button.danger { color: var(--danger); background: var(--bg); padding: 0.25rem 0.7rem; }
+button.link { border: 0; background: none; padding: 0; color: var(--accent); }
+button.link:hover { text-decoration: underline; }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 0.95rem; }
+th, td { text-align: left; padding: 0.5rem 0.6rem; border-bottom: 1px solid var(--line); white-space: nowrap; vertical-align: middle; }
+td.wrap { white-space: normal; overflow-wrap: anywhere; min-width: 12rem; }
+th { color: var(--muted); font-weight: 600; }
+.status { font-size: 0.85rem; padding: 0.1rem 0.45rem; border-radius: 4px; border: 1px solid var(--line); }
+.status-active { border-color: var(--good-line); background: var(--good-bg); }
+.status-revoked { border-color: var(--bad-line); background: var(--bad-bg); }
+footer { max-width: 56rem; margin: 0 auto; padding: 1rem; color: var(--muted); font-size: 0.85rem; border-top: 1px solid var(--line); overflow-wrap: anywhere; }

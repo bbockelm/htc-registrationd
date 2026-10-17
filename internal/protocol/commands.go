@@ -37,6 +37,9 @@ const (
 	RegStatus = Base + 4
 	// RegRenewNow asks the CE daemon to renew immediately. ADMINISTRATOR.
 	RegRenewNow = Base + 5
+	// RegRequestApproval asks the CE daemon to start an approval-mode
+	// request now and replies with its URL and code. ADMINISTRATOR.
+	RegRequestApproval = Base + 6
 
 	// Registrar administration (CLI path). ADMINISTRATOR.
 
@@ -66,6 +69,8 @@ func CommandName(cmd int) string {
 		return "REG_STATUS"
 	case RegRenewNow:
 		return "REG_RENEW_NOW"
+	case RegRequestApproval:
+		return "REG_REQUEST_APPROVAL"
 	case RegAdminList:
 		return "REG_ADMIN_LIST"
 	case RegAdminApprove:

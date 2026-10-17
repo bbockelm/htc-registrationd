@@ -8,6 +8,8 @@ require (
 	github.com/bbockelm/golang-htcondor v0.20.3-0.20261017130920-6169867573e4
 	github.com/glebarez/go-sqlite v1.23.0
 	golang.org/x/crypto v0.55.0
+	golang.org/x/oauth2 v0.37.0
+	golang.org/x/time v0.15.0
 )
 
 require (
@@ -32,7 +34,6 @@ require (
 	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/time v0.15.0 // indirect
 	modernc.org/libc v1.74.3 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect

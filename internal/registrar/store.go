@@ -190,6 +190,11 @@ func OpenStore(path string, now func() time.Time) (*Store, error) {
 // Close closes the database.
 func (s *Store) Close() error { return s.db.Close() }
 
+// DB returns the database, for components that keep their own tables beside
+// the registrar's (the web UI's sessions). It has a single connection: a
+// caller must not hold a transaction open while calling the Store.
+func (s *Store) DB() *sql.DB { return s.db }
+
 func unix(t time.Time) int64 {
 	if t.IsZero() {
 		return 0
