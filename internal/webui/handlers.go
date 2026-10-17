@@ -42,7 +42,7 @@ func (s *Server) routes() http.Handler {
 
 func (s *Server) limit(l *ipLimiter, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !l.allow(clientIP(r)) {
+		if !l.allow(s.clientIP(r)) {
 			w.Header().Set("Retry-After", "60")
 			s.message(w, r, http.StatusTooManyRequests, "Too many requests", "Wait a minute and try again.")
 			return
@@ -225,7 +225,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if state == "" || code == "" || bound == "" || !secret.Equal(state, bound) {
-		s.log.Warn("webui: login callback with a missing or mismatched state", "client", clientIP(r))
+		s.log.Warn("webui: login callback with a missing or mismatched state", "client", s.clientIP(r))
 		s.message(w, r, http.StatusBadRequest, "Sign-in failed", "This sign-in did not start in this browser, or took too long. Start again.")
 		return
 	}
@@ -261,7 +261,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setCookie(w, sessionCookie, sid, 0)
-	s.log.Info("webui: signed in", "principal", id.Principal, "client", clientIP(r))
+	s.log.Info("webui: signed in", "principal", id.Principal, "client", s.clientIP(r))
 	if !safeNext(next) {
 		next = "/approve"
 	}
@@ -414,7 +414,7 @@ func (s *Server) handleApproveDecision(w http.ResponseWriter, r *http.Request) {
 	}
 	if !d.Allowed {
 		s.log.Warn("webui: unauthorized decision refused", "principal", sess.Principal, "name", rec.Name,
-			"code", code, "authorization", d.Audit(), "client", clientIP(r))
+			"code", code, "authorization", d.Audit(), "client", s.clientIP(r))
 		s.message(w, r, http.StatusForbidden, "Not authorized", "You are not authorized to approve "+rec.Name+". "+d.Reason)
 		return
 	}
@@ -433,7 +433,7 @@ func (s *Server) handleApproveDecision(w http.ResponseWriter, r *http.Request) {
 		verb = "approved"
 	}
 	s.log.Info("registrar: request "+verb+" in the web UI", "request", rec.Number, "name", rec.Name, "code", code,
-		"by", who.String(), "authorization", d.Audit(), "client", clientIP(r))
+		"by", who.String(), "authorization", d.Audit(), "client", s.clientIP(r))
 	http.Redirect(w, r, "/approve?code="+url.QueryEscape(code), http.StatusSeeOther)
 }
 
@@ -543,6 +543,6 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.log.Warn("registrar: registration revoked in the web UI", "registration", reg.ID, "name", reg.Name,
-		"by", who.String(), "client", clientIP(r))
+		"by", who.String(), "client", s.clientIP(r))
 	http.Redirect(w, r, "/registrations?revoked="+url.QueryEscape(reg.ID), http.StatusSeeOther)
 }

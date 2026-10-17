@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -804,20 +805,58 @@ func TestRateLimits(t *testing.T) {
 	if !l.allow("b") {
 		t.Fatal("buckets are not per address")
 	}
-	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil)
-	req.RemoteAddr = "127.0.0.1:5555"
-	req.Header.Add("X-Forwarded-For", "203.0.113.9, 198.51.100.7")
-	if got := clientIP(req); got != "198.51.100.7" {
-		t.Errorf("behind the proxy: %s", got)
+}
+
+func TestClientIPTrustedProxies(t *testing.T) {
+	def, err := parseProxies(DefaultTrustedProxies)
+	if err != nil {
+		t.Fatal(err)
 	}
-	req.TLS = &tls.ConnectionState{}
-	if got := clientIP(req); got != "127.0.0.1" {
-		t.Errorf("HTTPS listener trusted X-Forwarded-For: %s", got)
+	custom, err := parseProxies([]string{"127.0.0.1", "10.0.0.0/8"})
+	if err != nil {
+		t.Fatal(err)
 	}
-	req.TLS = nil
-	req.RemoteAddr = "192.0.2.1:5555"
-	if got := clientIP(req); got != "192.0.2.1" {
-		t.Errorf("non-loopback peer trusted X-Forwarded-For: %s", got)
+	for _, tc := range []struct {
+		desc    string
+		proxies []netip.Prefix
+		peer    string
+		xff     []string
+		tls     bool
+		want    string
+	}{
+		{"behind the proxy", def, "127.0.0.1:5555", []string{"203.0.113.9, 198.51.100.7"}, false, "198.51.100.7"},
+		{"IPv6 loopback proxy", def, "[::1]:5555", []string{"198.51.100.7"}, false, "198.51.100.7"},
+		{"a trusted hop is skipped", def, "127.0.0.1:5555", []string{"198.51.100.7, 127.0.0.1"}, false, "198.51.100.7"},
+		{"several headers", def, "127.0.0.1:5555", []string{"203.0.113.9", "198.51.100.7"}, false, "198.51.100.7"},
+		{"trusted chain", custom, "127.0.0.1:5555", []string{"203.0.113.9, 198.51.100.7, 10.1.2.3"}, false, "198.51.100.7"},
+		{"forged hop past the last untrusted one", custom, "127.0.0.1:5555", []string{"10.9.9.9, 198.51.100.7, 10.1.2.3"}, false, "198.51.100.7"},
+		{"unparsable hop", def, "127.0.0.1:5555", []string{"198.51.100.7, garbage"}, false, "127.0.0.1"},
+		{"no header", def, "127.0.0.1:5555", nil, false, "127.0.0.1"},
+		{"HTTPS listener", def, "127.0.0.1:5555", []string{"198.51.100.7"}, true, "127.0.0.1"},
+		{"untrusted peer", def, "192.0.2.1:5555", []string{"198.51.100.7"}, false, "192.0.2.1"},
+		{"loopback outside the list", def, "127.0.0.2:5555", []string{"198.51.100.7"}, false, "127.0.0.2"},
+	} {
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil)
+		req.RemoteAddr = tc.peer
+		for _, v := range tc.xff {
+			req.Header.Add("X-Forwarded-For", v)
+		}
+		if tc.tls {
+			req.TLS = &tls.ConnectionState{}
+		}
+		if got := clientIP(req, tc.proxies); got != tc.want {
+			t.Errorf("%s: %s, want %s", tc.desc, got, tc.want)
+		}
+	}
+	if _, err := parseProxies([]string{"proxy.example.org"}); err == nil {
+		t.Error("a host name was accepted as a proxy")
+	}
+	c, err := FromConfig(knobs.Map{"HTC_REGISTRATIOND_TRUSTED_PROXIES": "192.0.2.5, 2001:db8::/32"})
+	if err != nil || len(c.TrustedProxies) != 2 || !trustedProxy(netip.MustParseAddr("2001:db8::7"), c.TrustedProxies) {
+		t.Errorf("TRUSTED_PROXIES: %v, %v", c, err)
+	}
+	if _, err := FromConfig(knobs.Map{"HTC_REGISTRATIOND_TRUSTED_PROXIES": "nope"}); err == nil {
+		t.Error("a bad TRUSTED_PROXIES was accepted")
 	}
 }
 

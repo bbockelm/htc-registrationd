@@ -2,6 +2,7 @@ package webui
 
 import (
 	"container/list"
+	"fmt"
 	"net"
 	"net/http"
 	"net/netip"
@@ -41,29 +42,73 @@ func withHeaders(next http.Handler) http.Handler {
 	})
 }
 
+// DefaultTrustedProxies are the reverse proxies whose X-Forwarded-For is
+// read when HTC_REGISTRATIOND_TRUSTED_PROXIES is not set.
+var DefaultTrustedProxies = []string{"127.0.0.1", "::1"}
+
+// parseProxies reads addresses and CIDR prefixes.
+func parseProxies(list []string) ([]netip.Prefix, error) {
+	out := make([]netip.Prefix, 0, len(list))
+	for _, v := range list {
+		if p, err := netip.ParsePrefix(v); err == nil {
+			out = append(out, p.Masked())
+			continue
+		}
+		a, err := netip.ParseAddr(v)
+		if err != nil {
+			return nil, fmt.Errorf("HTC_REGISTRATIOND_TRUSTED_PROXIES: %q is not an address or prefix", v)
+		}
+		a = a.Unmap()
+		out = append(out, netip.PrefixFrom(a, a.BitLen()))
+	}
+	return out, nil
+}
+
+func trustedProxy(a netip.Addr, proxies []netip.Prefix) bool {
+	for _, p := range proxies {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
+}
+
 // clientIP is the address requests are rate-limited by. On the plain-HTTP
-// listener, which accepts only loopback connections from a reverse proxy,
-// it is the last X-Forwarded-For entry (the one the proxy added); the
-// header is never used for anything else, and never on the HTTPS listener.
-func clientIP(r *http.Request) string {
+// listener, when the connection comes from a trusted proxy, it is the
+// nearest X-Forwarded-For hop that is not itself a trusted proxy; the
+// header is never used for anything else, and never on the HTTPS
+// listener.
+func clientIP(r *http.Request, proxies []netip.Prefix) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
 	}
-	ip := net.ParseIP(host)
-	if r.TLS == nil && ip != nil && ip.IsLoopback() {
-		if xff := r.Header.Values("X-Forwarded-For"); len(xff) > 0 {
-			parts := strings.Split(xff[len(xff)-1], ",")
-			if fwd := net.ParseIP(strings.TrimSpace(parts[len(parts)-1])); fwd != nil {
-				return fwd.String()
-			}
+	peer, err := netip.ParseAddr(host)
+	if err != nil {
+		return host
+	}
+	client := peer.WithZone("").Unmap()
+	if r.TLS != nil || !trustedProxy(client, proxies) {
+		return client.String()
+	}
+	var hops []string
+	for _, v := range r.Header.Values("X-Forwarded-For") {
+		hops = append(hops, strings.Split(v, ",")...)
+	}
+	for i := len(hops) - 1; i >= 0; i-- {
+		a, err := netip.ParseAddr(strings.TrimSpace(hops[i]))
+		if err != nil {
+			break
+		}
+		client = a.WithZone("").Unmap()
+		if !trustedProxy(client, proxies) {
+			break
 		}
 	}
-	if ip != nil {
-		return ip.String()
-	}
-	return host
+	return client.String()
 }
+
+func (s *Server) clientIP(r *http.Request) string { return clientIP(r, s.cfg.TrustedProxies) }
 
 // ipLimiter is a token bucket per client network: the address for IPv4,
 // its /64 for IPv6, since one host commonly holds a whole /64.

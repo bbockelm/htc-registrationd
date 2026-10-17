@@ -160,8 +160,11 @@ used as identity.
   within a minute, and on `condor_reconfig`.
 - `HTTP_ADDR`: a plain-HTTP listener on a loopback address (e.g.
   `127.0.0.1:8080`) for a reverse proxy that terminates TLS. The proxy must
-  set `X-Forwarded-For`; on this listener its last entry is the address
-  requests are rate-limited by, and it is used for nothing else.
+  set `X-Forwarded-For`; on this listener, for connections from a trusted
+  proxy, its nearest entry that is not a trusted proxy is the address
+  requests are rate-limited by. It is used for nothing else.
+- `TRUSTED_PROXIES`: addresses or CIDR prefixes of those proxies; default
+  `127.0.0.1, ::1`.
 - `PUBLIC_URL`: required; the `https://` origin browsers and CEs use, with no
   path (`http://` only for a loopback host). It is used in lower case and
   without a default port (`:443`).

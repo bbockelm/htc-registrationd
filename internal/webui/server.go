@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
@@ -53,6 +54,9 @@ type Config struct {
 	// HTTPAddr is a plain-HTTP listener on a loopback address, for a
 	// reverse proxy that terminates TLS.
 	HTTPAddr string
+	// TrustedProxies are the proxies whose X-Forwarded-For is read on the
+	// HTTPAddr listener (default DefaultTrustedProxies).
+	TrustedProxies []netip.Prefix
 
 	OIDC OIDCConfig
 	// ClientSecretFile holds the OIDC client secret; it is read with
@@ -97,6 +101,9 @@ func FromConfig(cfg knobs.Getter) (*Config, error) {
 		},
 	}
 	var err error
+	if c.TrustedProxies, err = parseProxies(knobs.List(cfg, "HTC_REGISTRATIOND_TRUSTED_PROXIES", DefaultTrustedProxies)); err != nil {
+		return nil, err
+	}
 	if c.SessionIdle, err = knobs.Duration(cfg, "HTC_REGISTRATIOND_SESSION_IDLE", time.Hour); err != nil {
 		return nil, err
 	}
@@ -220,6 +227,9 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	}
 	if cfg.Resolver == nil {
 		cfg.Resolver = net.DefaultResolver
+	}
+	if cfg.TrustedProxies == nil {
+		cfg.TrustedProxies, _ = parseProxies(DefaultTrustedProxies)
 	}
 	if cfg.SessionIdle <= 0 {
 		cfg.SessionIdle = time.Hour
