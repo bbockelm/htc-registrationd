@@ -1,0 +1,47 @@
+{{define "hidden"}}<input type="hidden" name="client_id" value="{{.ClientID}}">
+<input type="hidden" name="redirect_uri" value="{{.RedirectURI}}">
+<input type="hidden" name="state" value="{{.State}}">
+<input type="hidden" name="code_challenge" value="{{.Challenge}}">
+<input type="hidden" name="scope" value="{{.Scope}}">{{end}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in: demo identity provider</title>
+<style>
+body { font: 16px/1.5 system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; color: #1d2330; background: #f6f7f9; }
+h1 { font-size: 1.4rem; margin-bottom: .25rem; }
+.sub { color: #5a6270; margin-top: 0; }
+form { margin-bottom: .75rem; background: #fff; border: 1px solid #d9dde3; border-radius: 8px; padding: 1rem 1.25rem; }
+.user { display: flex; align-items: baseline; gap: .75rem; width: 100%; text-align: left; padding: .6rem .75rem; margin: .4rem 0; border: 1px solid #c8ced8; border-radius: 6px; background: #fff; font: inherit; cursor: pointer; }
+.user:hover, .user:focus { border-color: #3366cc; background: #eef3ff; }
+.user b { min-width: 6rem; }
+.user span { color: #5a6270; font-size: .92rem; }
+.other { display: flex; gap: .5rem; margin-top: 1rem; }
+.other input { flex: 1; padding: .45rem .6rem; font: inherit; border: 1px solid #c8ced8; border-radius: 6px; }
+.other button, .cancel { padding: .45rem .9rem; font: inherit; border-radius: 6px; border: 1px solid #c8ced8; background: #fff; cursor: pointer; }
+.cancel { margin-top: 1rem; }
+.error { color: #a32020; }
+code { font-size: .9em; }
+</style>
+</head>
+<body>
+<h1>Demo identity provider</h1>
+<p class="sub">Sign in to the htc-registrationd registrar as one of these identities. No password is needed.</p>
+{{if .Error}}<p class="error">{{.Error}}</p>{{end}}
+<form method="post" action="/authorize">
+{{template "hidden" .Req}}
+{{range .Users}}<button class="user" type="submit" name="user" value="{{.Sub}}"><b>{{.Sub}}</b><span>{{.Note}}</span></button>
+{{end}}
+</form>
+<form method="post" action="/authorize">
+{{template "hidden" .Req}}
+<div class="other">
+<input name="other" placeholder="any other subject" value="{{.Typed}}" aria-label="Subject">
+<button type="submit">Sign in</button>
+</div>
+<button class="cancel" type="submit" name="cancel" value="1">Cancel</button>
+</form>
+<p class="sub">Issuer <code>{{.Issuer}}</code></p>
+</body>
+</html>
