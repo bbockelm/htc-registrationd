@@ -312,6 +312,14 @@ func (s *Server) Reload() {
 	}
 }
 
+// listenTCP binds a web listener. Under a root master the daemon runs with
+// the condor user's effective uid, which cannot bind a port below 1024 such
+// as 443; droppriv binds as root when the process can, and as the current
+// user otherwise.
+var listenTCP = func(addr string) (net.Listener, error) {
+	return droppriv.ListenAsRoot("tcp", addr)
+}
+
 // Start binds the configured listeners and serves until ctx ends or stop is
 // called; stop waits for in-flight requests (up to 10 s).
 func (s *Server) Start(ctx context.Context) (stop func(), err error) {
@@ -322,9 +330,8 @@ func (s *Server) Start(ctx context.Context) (stop func(), err error) {
 			_ = ln.Close()
 		}
 	}
-	lc := net.ListenConfig{}
 	if s.cfg.HTTPSAddr != "" {
-		ln, err := lc.Listen(ctx, "tcp", s.cfg.HTTPSAddr)
+		ln, err := listenTCP(s.cfg.HTTPSAddr)
 		if err != nil {
 			return nil, fmt.Errorf("webui: HTTPS listener: %w", err)
 		}
@@ -335,7 +342,7 @@ func (s *Server) Start(ctx context.Context) (stop func(), err error) {
 		}))
 	}
 	if s.cfg.HTTPAddr != "" {
-		ln, err := lc.Listen(ctx, "tcp", s.cfg.HTTPAddr)
+		ln, err := listenTCP(s.cfg.HTTPAddr)
 		if err != nil {
 			closeAll()
 			return nil, fmt.Errorf("webui: HTTP listener: %w", err)

@@ -43,7 +43,25 @@ On the registrar:
 
 The daemon's address comes from -addr or its address file
 (HTC_REGISTRATIOND_ADDRESS_FILE, default $(LOG)/.htc_registrationd_address).
+The configuration is read from $CONDOR_CONFIG, or from
+/etc/condor-ce/condor_config when CONDOR_CONFIG is unset and that file exists.
 `
+
+// ceConfig is HTCondor-CE's configuration file. The daemon runs under
+// condor_ce_master, so the tool reads the CE's configuration, not the host's
+// HTCondor configuration, unless CONDOR_CONFIG says otherwise.
+var ceConfig = "/etc/condor-ce/condor_config"
+
+// useCEConfig sets CONDOR_CONFIG to ceConfig when it is unset and the file
+// exists.
+func useCEConfig() {
+	if _, set := os.LookupEnv("CONDOR_CONFIG"); set {
+		return
+	}
+	if _, err := os.Stat(ceConfig); err == nil {
+		_ = os.Setenv("CONDOR_CONFIG", ceConfig)
+	}
+}
 
 func runCLI(args []string) int {
 	fs := flag.NewFlagSet("htc-registration", flag.ContinueOnError)
@@ -63,6 +81,7 @@ func runCLI(args []string) int {
 		fs.Usage()
 		return 2
 	}
+	useCEConfig()
 	cfg, err := config.New()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "htc-registration: loading config:", err)

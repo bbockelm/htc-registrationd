@@ -102,3 +102,33 @@ func TestWriteFileViaNew(t *testing.T) {
 		t.Fatalf("the .new file was left behind: %v", err)
 	}
 }
+
+// The tool reads HTCondor-CE's configuration unless CONDOR_CONFIG names
+// another, and only when that file exists.
+func TestUseCEConfig(t *testing.T) {
+	old := ceConfig
+	t.Cleanup(func() { ceConfig = old })
+	ceConfig = filepath.Join(t.TempDir(), "condor_config")
+
+	t.Setenv("CONDOR_CONFIG", "/elsewhere/condor_config")
+	useCEConfig()
+	if got := os.Getenv("CONDOR_CONFIG"); got != "/elsewhere/condor_config" {
+		t.Errorf("a set CONDOR_CONFIG was replaced: %q", got)
+	}
+
+	if err := os.Unsetenv("CONDOR_CONFIG"); err != nil {
+		t.Fatal(err)
+	}
+	useCEConfig()
+	if v, set := os.LookupEnv("CONDOR_CONFIG"); set {
+		t.Errorf("CONDOR_CONFIG set to %q although %s does not exist", v, ceConfig)
+	}
+
+	if err := os.WriteFile(ceConfig, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	useCEConfig()
+	if got := os.Getenv("CONDOR_CONFIG"); got != ceConfig {
+		t.Errorf("CONDOR_CONFIG = %q, want %q", got, ceConfig)
+	}
+}
