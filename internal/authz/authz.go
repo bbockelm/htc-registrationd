@@ -43,6 +43,9 @@ type Backend interface {
 type Policy struct {
 	backends []Backend
 	admins   atomic.Pointer[map[string]bool]
+	// issuer, when set, is the OIDC issuer of "<issuer>,<sub>" principals.
+	// Configuration (ADMINS, the mapfile) names users by the bare subject.
+	issuer string
 	// Set by FromConfig, for Start and Reconfig.
 	mapfile  *Mapfile
 	topology *Topology
@@ -55,7 +58,30 @@ func NewPolicy(backends []Backend, admins []string) *Policy {
 	return p
 }
 
-// SetAdmins replaces the administrator principals.
+// SetSubjectIssuer declares that principals have the form
+// "<issuer>,<sub>" for the given issuer, and that administrators and
+// backends name users by the bare subject. A principal from any other
+// issuer matches nothing in configuration. An empty issuer means principals
+// are used as they are.
+func (p *Policy) SetSubjectIssuer(issuer string) {
+	p.issuer = strings.TrimRight(issuer, "/")
+}
+
+// ConfigName returns the name configuration (ADMINS, the mapfile) uses for
+// principal, and false when no configuration can name it (a principal from
+// another issuer).
+func (p *Policy) ConfigName(principal string) (string, bool) {
+	if p.issuer == "" {
+		return principal, principal != ""
+	}
+	iss, sub, ok := strings.Cut(principal, ",")
+	if !ok || strings.TrimRight(iss, "/") != p.issuer || sub == "" {
+		return "", false
+	}
+	return sub, true
+}
+
+// SetAdmins replaces the administrators, named as configuration names them.
 func (p *Policy) SetAdmins(admins []string) {
 	m := make(map[string]bool, len(admins))
 	for _, a := range admins {
@@ -68,11 +94,12 @@ func (p *Policy) SetAdmins(admins []string) {
 
 // IsAdmin reports whether principal is a registrar administrator.
 func (p *Policy) IsAdmin(principal string) bool {
-	if principal == "" {
+	name, ok := p.ConfigName(principal)
+	if !ok {
 		return false
 	}
 	m := p.admins.Load()
-	return m != nil && (*m)[principal]
+	return m != nil && (*m)[name]
 }
 
 // HasAdmins reports whether any administrator is configured.
@@ -90,12 +117,18 @@ func (p *Policy) Backends() []string {
 	return out
 }
 
-// Decide reports whether principal may approve name. When no backend allows
+// Decide reports whether principal may approve name. Administrators and
+// backends see the principal as configuration names it (see
+// SetSubjectIssuer and ConfigName). When no backend allows
 // it and at least one could not answer, the error is returned so a caller
 // does not mistake an outage for a denial.
 func (p *Policy) Decide(ctx context.Context, principal, name string) (Decision, error) {
 	if principal == "" {
 		return Decision{Reason: "No identity"}, nil
+	}
+	user, ok := p.ConfigName(principal)
+	if !ok {
+		return Decision{Reason: "Signed in through an identity provider this registrar does not use"}, nil
 	}
 	if p.IsAdmin(principal) {
 		return Decision{Allowed: true, Reason: "Registrar administrator"}, nil
@@ -106,7 +139,7 @@ func (p *Policy) Decide(ctx context.Context, principal, name string) (Decision, 
 	var reasons []string
 	var errs []error
 	for _, b := range p.backends {
-		d, err := b.Decide(ctx, principal, name)
+		d, err := b.Decide(ctx, user, name)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", b.Name(), err))
 			continue

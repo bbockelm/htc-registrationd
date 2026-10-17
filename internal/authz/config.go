@@ -10,11 +10,20 @@ import (
 	"github.com/bbockelm/htc-registrationd/internal/knobs"
 )
 
-// Admins reads HTC_REGISTRATIOND_ADMINS. Principals are separated by white
-// space only: the default principal form, "<issuer>,<subject>", contains a
-// comma.
+// Admins reads HTC_REGISTRATIOND_ADMINS, an HTCondor list (comma or white
+// space separated) of users as configuration names them: the bare subject
+// when HTC_REGISTRATIOND_OIDC_PRINCIPAL_CLAIM is sub, else the claim value.
 func Admins(cfg knobs.Getter) []string {
-	return strings.Fields(knobs.String(cfg, "HTC_REGISTRATIOND_ADMINS", ""))
+	return knobs.List(cfg, "HTC_REGISTRATIOND_ADMINS", nil)
+}
+
+// subjectIssuer is the issuer of "<issuer>,<sub>" principals, or "" when
+// the principal claim is not sub and principals are bare claim values.
+func subjectIssuer(cfg knobs.Getter) string {
+	if knobs.String(cfg, "HTC_REGISTRATIOND_OIDC_PRINCIPAL_CLAIM", "sub") != "sub" {
+		return ""
+	}
+	return knobs.String(cfg, "HTC_REGISTRATIOND_OIDC_ISSUER", "")
 }
 
 // FromConfig builds the policy named by HTC_REGISTRATIOND_AUTHZ (a list of
@@ -57,6 +66,7 @@ func FromConfig(cfg knobs.Getter, log *slog.Logger) (*Policy, error) {
 		}
 	}
 	p := NewPolicy(backends, Admins(cfg))
+	p.SetSubjectIssuer(subjectIssuer(cfg))
 	p.mapfile, p.topology = mf, topo
 	return p, nil
 }

@@ -91,9 +91,8 @@ func newHarness(t *testing.T) *harness {
 	t.Cleanup(func() { _ = store.Close() })
 	idp := newMockIDP(t)
 	mapPath := filepath.Join(t.TempDir(), "authz.map")
-	// alice by the default principal form (<issuer>,<sub>); carol by a
-	// regular expression.
-	content := `OIDC "` + idp.URL() + `,alice" ` + testCE + `,*.grid.example.org` + "\n" +
+	// Configuration names users by subject; carol by a regular expression.
+	content := `OIDC alice ` + testCE + `,*.grid.example.org` + "\n" +
 		`OIDC /^carol$/ other.example.edu` + "\n"
 	if err := os.WriteFile(mapPath, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
@@ -102,7 +101,8 @@ func newHarness(t *testing.T) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	policy := authz.NewPolicy([]authz.Backend{mf}, []string{idp.URL() + ",root"})
+	policy := authz.NewPolicy([]authz.Backend{mf}, []string{"root"})
+	policy.SetSubjectIssuer(idp.URL())
 
 	var handler atomic.Value
 	web := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -239,11 +239,15 @@ func TestLoginThenApprove(t *testing.T) {
 		"mapfile line 1",
 		`value="approve"`,
 		"Alice Admin",
-		h.idp.URL() + ",alice",
+		// The footer names the user as configuration does: the subject.
+		"<code>alice</code>",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("approve page lacks %q", want)
 		}
+	}
+	if strings.Contains(body, h.idp.URL()+",alice") {
+		t.Error("approve page shows the issuer-qualified principal")
 	}
 	if h.idp.pkceRejections != 0 || len(h.idp.challenges) != 1 {
 		t.Errorf("PKCE: %d challenges, %d rejections", len(h.idp.challenges), h.idp.pkceRejections)

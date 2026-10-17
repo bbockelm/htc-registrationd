@@ -122,6 +122,10 @@ func (s *Server) base(r *http.Request, title string) base {
 	b := base{Title: title}
 	if ref := currentSession(r); ref != nil {
 		b.User, b.CSRF, b.IsAdmin = ref.sess, ref.sess.CSRF, s.cfg.Authz.IsAdmin(ref.sess.Principal)
+		b.UserName = ref.sess.Principal
+		if name, ok := s.cfg.Authz.ConfigName(ref.sess.Principal); ok {
+			b.UserName = name
+		}
 	}
 	return b
 }

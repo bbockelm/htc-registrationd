@@ -14,7 +14,7 @@ import (
 )
 
 const testMap = `# CE administrators
-OIDC "https://idp.example.org,alice" ce1.example.edu,*.grid.example.org
+OIDC alice ce1.example.edu,*.grid.example.org
 OIDC bob CE2.Example.EDU
 SSL  bob ignored.example.edu
 OIDC /^carol-[0-9]+$/ ce3.example.edu,ce4.example.edu
@@ -45,7 +45,7 @@ func newTestMapfile(t *testing.T) (*Mapfile, string, *clock) {
 func TestMapfileDecide(t *testing.T) {
 	m, _, _ := newTestMapfile(t)
 	ctx := context.Background()
-	alice := "https://idp.example.org,alice"
+	alice := "alice"
 	cases := []struct {
 		principal, name string
 		allowed         bool
@@ -64,7 +64,7 @@ func TestMapfileDecide(t *testing.T) {
 		{"bob", "ignored.example.edu", false, "Mapfile line 3 does not list ignored.example.edu"},
 		{"carol-42", "ce4.example.edu", true, "mapfile line 5"},
 		{"carol-x", "ce4.example.edu", false, "No mapfile line matches your identity"},
-		{"alice", "ce1.example.edu", false, "No mapfile line matches your identity"},
+		{"https://idp.example.org,alice", "ce1.example.edu", false, "No mapfile line matches your identity"},
 		{"", "ce1.example.edu", false, "No mapfile line matches your identity"},
 	}
 	for _, tc := range cases {
@@ -222,7 +222,8 @@ func TestFromConfig(t *testing.T) {
 	p, err := FromConfig(knobs.Map{
 		"HTC_REGISTRATIOND_AUTHZ":         "mapfile, topology",
 		"HTC_REGISTRATIOND_AUTHZ_MAPFILE": path,
-		"HTC_REGISTRATIOND_ADMINS":        "https://idp.example.org,root  other",
+		"HTC_REGISTRATIOND_ADMINS":        "root,other  third",
+		"HTC_REGISTRATIOND_OIDC_ISSUER":   "https://idp.example.org/",
 	}, slog.Default())
 	if err != nil {
 		t.Fatal(err)
@@ -230,12 +231,36 @@ func TestFromConfig(t *testing.T) {
 	if got := p.Backends(); len(got) != 2 || got[0] != "mapfile" || got[1] != "topology" {
 		t.Errorf("backends %v", got)
 	}
-	if !p.IsAdmin("https://idp.example.org,root") || !p.IsAdmin("other") || p.IsAdmin("https://idp.example.org") {
-		t.Error("admins are split on white space only")
+	// ADMINS is an HTCondor list of subjects; principals are
+	// "<issuer>,<sub>" for the configured issuer only.
+	for _, who := range []string{"https://idp.example.org,root", "https://idp.example.org/,other", "https://idp.example.org,third"} {
+		if !p.IsAdmin(who) {
+			t.Errorf("%q is not an administrator", who)
+		}
 	}
-	// The mapfile answers while Topology has no data.
-	if d, err := p.Decide(context.Background(), "bob", "ce2.example.edu"); err != nil || !d.Allowed {
+	for _, who := range []string{"root", "https://other.example.org,root", "https://idp.example.org,", "https://idp.example.org"} {
+		if p.IsAdmin(who) {
+			t.Errorf("%q is an administrator", who)
+		}
+	}
+	// The mapfile answers, by subject, while Topology has no data.
+	if d, err := p.Decide(context.Background(), "https://idp.example.org,bob", "ce2.example.edu"); err != nil || !d.Allowed {
 		t.Errorf("%+v, %v", d, err)
+	}
+	if d, err := p.Decide(context.Background(), "https://other.example.org,bob", "ce2.example.edu"); err != nil || d.Allowed {
+		t.Errorf("another issuer's subject was allowed: %+v, %v", d, err)
+	}
+	// With another principal claim, principals are the bare claim value.
+	q, err := FromConfig(knobs.Map{
+		"HTC_REGISTRATIOND_ADMINS":               "OSG1000001",
+		"HTC_REGISTRATIOND_OIDC_ISSUER":          "https://idp.example.org",
+		"HTC_REGISTRATIOND_OIDC_PRINCIPAL_CLAIM": "osgid",
+	}, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !q.IsAdmin("OSG1000001") || q.IsAdmin("https://idp.example.org,OSG1000001") {
+		t.Error("osgid principals are not compared as bare claim values")
 	}
 	for _, bad := range []knobs.Map{
 		{"HTC_REGISTRATIOND_AUTHZ": "ldap"},

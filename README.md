@@ -163,12 +163,14 @@ used as identity.
   reconfig).
 - `OIDC_SCOPES`: default `openid email profile`. CILogon needs
   `openid email profile org.cilogon.userinfo` to release `osgid`.
-- `OIDC_PRINCIPAL_CLAIM`: default `sub`, for which a user's principal is
-  `<issuer>,<sub>`. For any other claim the principal is the claim's value.
-  For OSG Topology, set `osgid`.
-- `ADMINS`: registrar administrators, as principals separated by white space
-  (a principal may contain a comma). They may approve any name, and see and
-  revoke every registration. Re-read on reconfig.
+- `OIDC_PRINCIPAL_CLAIM`: default `sub`. Configuration (`ADMINS`, the
+  mapfile) names a user by this claim's value. With `sub`, the registrar
+  records a user as `<issuer>,<sub>`, and a recorded user matches
+  configuration only while `OIDC_ISSUER` is still that issuer. For OSG
+  Topology, set `osgid`.
+- `ADMINS`: registrar administrators, a comma- or space-separated list of
+  users by `OIDC_PRINCIPAL_CLAIM` value. They may approve any name, and see
+  and revoke every registration. Re-read on reconfig.
 - `SESSION_IDLE` (1 h), `SESSION_LIFETIME` (12 h). Sessions are kept in the
   registrar's database.
 
@@ -187,18 +189,19 @@ rate-limited per client address.
   it. Changing the list takes a restart.
 
 **mapfile** (`AUTHZ_MAPFILE`): an HTCondor map file. Lines of method `OIDC`
-map a principal to the comma-separated CE names it may approve:
+map a user, by `OIDC_PRINCIPAL_CLAIM` value, to the comma-separated CE names
+the user may approve:
 
 ```
-# method  principal (literal, or /regex/)     CE names
-OIDC "https://cilogon.org,http://cilogon.org/serverA/users/1234" ce1.example.edu,*.grid.example.edu
-OIDC /^https:\/\/idp\.example\.org,ops-[0-9]+$/               ce2.example.edu
+# method  user (literal, or /regex/)                 CE names
+OIDC http://cilogon.org/serverA/users/1234          ce1.example.edu,*.grid.example.edu
+OIDC /^ops-[0-9]+$/                                 ce2.example.edu
 ```
 
 A regular expression is written between slashes, so a `/` inside it is
 written `\/`. A name is literal or a `path.Match` glob (`*` also matches
 dots); names compare without regard to case. As in any HTCondor map file, only the first
-line whose principal matches is used, so list all of a principal's names on
+line whose user matches is used, so list all of a user's names on
 that line. Only literal names are known for callback mode: a glob can approve
 names but never makes one known, since callback mode needs the name written
 out. The file is re-read when its modification time changes and on

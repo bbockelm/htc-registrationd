@@ -22,7 +22,7 @@
 {{template "content" .}}
 </main>
 {{- if .User}}
-<footer>Signed in as {{if .User.DisplayName}}{{.User.DisplayName}} · {{end}}<code>{{.User.Principal}}</code>{{if .IsAdmin}} · registrar administrator{{end}}</footer>
+<footer>Signed in as {{if .User.DisplayName}}{{.User.DisplayName}} · {{end}}<code>{{.UserName}}</code>{{if .IsAdmin}} · registrar administrator{{end}}</footer>
 {{- end}}
 </body>
 </html>

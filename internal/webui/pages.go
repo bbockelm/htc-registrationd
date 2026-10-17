@@ -45,10 +45,12 @@ func loadPages() (*pages, error) {
 // base is what every page shows: the signed-in user and the CSRF token
 // for the sign-out form.
 type base struct {
-	Title   string
-	User    *session
-	IsAdmin bool
-	CSRF    string
+	Title string
+	User  *session
+	// UserName is how configuration names the user.
+	UserName string
+	IsAdmin  bool
+	CSRF     string
 }
 
 // messagePage is a heading, a statement and an optional link.

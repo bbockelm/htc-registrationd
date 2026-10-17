@@ -27,6 +27,9 @@ import (
 type Authorizer interface {
 	Decide(ctx context.Context, principal, name string) (authz.Decision, error)
 	IsAdmin(principal string) bool
+	// ConfigName is how configuration names principal, shown so an
+	// administrator can copy it into ADMINS or the mapfile.
+	ConfigName(principal string) (string, bool)
 }
 
 // Resolver is the DNS the approval page uses to name a request's source.
