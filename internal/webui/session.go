@@ -10,9 +10,9 @@ import (
 	"github.com/bbockelm/htc-registrationd/internal/secret"
 )
 
-// Sessions and in-flight logins live in the registrar's database. Session
-// ids and login states are stored only as hashes; the cookie carries the
-// value.
+// Sessions live in the registrar's database, by the hash of their id; the
+// cookie carries the id. Logins in flight are kept in memory (loginStore);
+// web_logins, which once held them, is dropped.
 const sessionSchema = `
 CREATE TABLE IF NOT EXISTS web_sessions (
 	id_hash      TEXT PRIMARY KEY,
@@ -22,16 +22,8 @@ CREATE TABLE IF NOT EXISTS web_sessions (
 	created_at   INTEGER NOT NULL,
 	last_seen_at INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS web_logins (
-	state_hash TEXT PRIMARY KEY,
-	verifier   TEXT NOT NULL,
-	next       TEXT NOT NULL DEFAULT '',
-	created_at INTEGER NOT NULL
-);
+DROP TABLE IF EXISTS web_logins;
 `
-
-// loginTTL bounds how long a login may take at the identity provider.
-const loginTTL = 10 * time.Minute
 
 // touchEvery limits how often a session's last-seen time is written.
 const touchEvery = time.Minute
@@ -120,45 +112,10 @@ func (s *sessionStore) remove(ctx context.Context, id string) error {
 	return err
 }
 
-// saveLogin records an authorization request in flight.
-func (s *sessionStore) saveLogin(ctx context.Context, state, verifier, next string) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO web_logins (state_hash, verifier, next, created_at) VALUES (?,?,?,?)`,
-		secret.Hash(state), verifier, next, s.now().Unix())
-	if err != nil {
-		return fmt.Errorf("webui: recording login: %w", err)
-	}
-	return nil
-}
-
-// takeLogin returns and deletes the login with state. Each state is good
-// for one callback, within loginTTL.
-func (s *sessionStore) takeLogin(ctx context.Context, state string) (verifier, next string, err error) {
-	h := secret.Hash(state)
-	var created int64
-	err = s.db.QueryRowContext(ctx, `SELECT verifier, next, created_at FROM web_logins WHERE state_hash = ?`, h).
-		Scan(&verifier, &next, &created)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", "", errNoSession
-	}
-	if err != nil {
-		return "", "", err
-	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM web_logins WHERE state_hash = ?`, h); err != nil {
-		return "", "", err
-	}
-	if s.now().Sub(time.Unix(created, 0)) > loginTTL {
-		return "", "", errNoSession
-	}
-	return verifier, next, nil
-}
-
-// prune deletes expired sessions and abandoned logins.
+// prune deletes expired sessions.
 func (s *sessionStore) prune(ctx context.Context) error {
 	now := s.now()
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM web_sessions WHERE last_seen_at < ? OR created_at < ?`,
-		now.Add(-s.idle).Unix(), now.Add(-s.lifetime).Unix()); err != nil {
-		return err
-	}
-	_, err := s.db.ExecContext(ctx, `DELETE FROM web_logins WHERE created_at < ?`, now.Add(-loginTTL).Unix())
+	_, err := s.db.ExecContext(ctx, `DELETE FROM web_sessions WHERE last_seen_at < ? OR created_at < ?`,
+		now.Add(-s.idle).Unix(), now.Add(-s.lifetime).Unix())
 	return err
 }

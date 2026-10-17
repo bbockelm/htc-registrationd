@@ -18,10 +18,22 @@ import (
 // Decision is the answer to "may this principal approve this name?".
 type Decision struct {
 	Allowed bool
-	// Reason states the fact behind the decision, for display and audit:
+	// Reason states the fact behind the decision, shown to the user:
 	// "Administrative Contact (Primary) for resource X in OSG Topology",
-	// "mapfile line 3", or why the principal is not authorized.
+	// "Allowed by the registrar's map file", or why the principal is not
+	// authorized.
 	Reason string
+	// Source locates the configuration behind the decision (a map file
+	// and line), for the audit log only; it is never shown in the UI.
+	Source string
+}
+
+// Audit is the decision's reason with its source, for logs and records.
+func (d Decision) Audit() string {
+	if d.Source == "" {
+		return d.Reason
+	}
+	return d.Reason + " (" + d.Source + ")"
 }
 
 // Backend is one source of authorization.
@@ -95,9 +107,12 @@ func (p *Policy) SetAdmins(admins []string) {
 // IsAdmin reports whether principal is a registrar administrator.
 func (p *Policy) IsAdmin(principal string) bool {
 	name, ok := p.ConfigName(principal)
-	if !ok {
-		return false
-	}
+	return ok && p.isAdminName(name)
+}
+
+// isAdminName reports whether name, as configuration names users, is an
+// administrator.
+func (p *Policy) isAdminName(name string) bool {
 	m := p.admins.Load()
 	return m != nil && (*m)[name]
 }
@@ -130,13 +145,13 @@ func (p *Policy) Decide(ctx context.Context, principal, name string) (Decision, 
 	if !ok {
 		return Decision{Reason: "Signed in through an identity provider this registrar does not use"}, nil
 	}
-	if p.IsAdmin(principal) {
+	if p.isAdminName(user) {
 		return Decision{Allowed: true, Reason: "Registrar administrator"}, nil
 	}
 	if len(p.backends) == 0 {
 		return Decision{Reason: "No authorization source is configured on this registrar"}, nil
 	}
-	var reasons []string
+	var reasons, sources []string
 	var errs []error
 	for _, b := range p.backends {
 		d, err := b.Decide(ctx, user, name)
@@ -150,11 +165,14 @@ func (p *Policy) Decide(ctx context.Context, principal, name string) (Decision, 
 		if d.Reason != "" {
 			reasons = append(reasons, d.Reason)
 		}
+		if d.Source != "" {
+			sources = append(sources, d.Source)
+		}
 	}
 	if len(errs) > 0 {
 		return Decision{}, errors.Join(errs...)
 	}
-	return Decision{Reason: strings.Join(reasons, "; ")}, nil
+	return Decision{Reason: strings.Join(reasons, "; "), Source: strings.Join(sources, "; ")}, nil
 }
 
 // Known reports whether any backend explicitly names name. When none does

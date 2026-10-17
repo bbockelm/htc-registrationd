@@ -3,6 +3,7 @@ package registrar
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -649,6 +650,39 @@ func TestValidName(t *testing.T) {
 	for _, bad := range []string{"", ".example.edu", "a..b", "-ce.example.edu", "ce-.edu", "ce example", "ce@example", "a/b"} {
 		if err := ValidName(bad); err == nil {
 			t.Errorf("%q accepted", bad)
+		}
+	}
+}
+
+func TestCEVersionIsValidated(t *testing.T) {
+	f := newStoreFixture(t)
+	ctx := context.Background()
+	for i, tc := range []struct {
+		in, want string
+	}{
+		{"25.0.1", "25.0.1"},
+		{"v0.3.0-4-gabc1234-dirty", "v0.3.0-4-gabc1234-dirty"},
+		{"1.2+build_7", "1.2+build_7"},
+		{"", ""},
+		{"25.0.1 htc-registrationd/0.3", ""},
+		{"$CondorVersion: 25.0.0 $", ""},
+		{"1.0\nRequested from 192.0.2.1", ""},
+		{"1.0<b>", ""},
+		{"0123456789012345678901234567890123", ""}, // 34 characters
+		{"25.0.1\u00a0", ""},
+	} {
+		code := fmt.Sprintf("CEVR-%04d", i)
+		n, err := f.store.CreateRequest(ctx, NewRequest{RequestIDHash: "rid-" + code, NonceHash: "n", Name: "ce.test",
+			Method: "approval", CEVersion: tc.in, UserCode: code, Status: ReqPending, TTL: time.Hour})
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, err := f.store.RequestByUserCode(ctx, code)
+		if err != nil || r.Number != n {
+			t.Fatalf("%q: %+v, %v", tc.in, r, err)
+		}
+		if r.CEVersion != tc.want {
+			t.Errorf("CEVersion %q stored as %q, want %q", tc.in, r.CEVersion, tc.want)
 		}
 	}
 }

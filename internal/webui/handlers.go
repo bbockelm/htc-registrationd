@@ -42,7 +42,7 @@ func (s *Server) routes() http.Handler {
 
 func (s *Server) limit(l *ipLimiter, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !l.allow(clientIP(r)) {
+		if !l.allow(s.clientIP(r)) {
 			w.Header().Set("Retry-After", "60")
 			s.message(w, r, http.StatusTooManyRequests, "Too many requests", "Wait a minute and try again.")
 			return
@@ -134,14 +134,39 @@ func approver(sess *session) registrar.Identity {
 	return registrar.Identity{Kind: authz.IdentityKind, Principal: sess.Principal}
 }
 
-// requireLogin returns the session, or redirects to login (GET) or refuses
-// (POST) and returns nil.
+// codeFormMarker is a query parameter only the code form sends.
+const codeFormMarker = "via"
+
+// requireLogin returns the session, or sends the browser to sign in (GET)
+// or refuses (POST) and returns nil.
 func (s *Server) requireLogin(w http.ResponseWriter, r *http.Request) *session {
 	if ref := currentSession(r); ref != nil {
 		return ref.sess
 	}
 	if r.Method == http.MethodGet {
-		http.Redirect(w, r, "/login?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusSeeOther)
+		q := r.URL.Query()
+		fromForm := q.Get(codeFormMarker) == "form"
+		q.Del(codeFormMarker)
+		next := r.URL.Path
+		if len(q) > 0 {
+			next += "?" + q.Encode()
+		}
+		login := "/login?next=" + url.QueryEscape(next)
+		if fromForm {
+			// The code form was submitted after the session ended. The
+			// Content-Security-Policy's form-action 'self' also governs every
+			// redirect that follows a form submission, so redirecting it to
+			// the identity provider would be blocked. Ending here, at a link
+			// the user follows as a new navigation, keeps form-action at
+			// 'self'. Adding the provider's origin to form-action instead
+			// would still block any redirect the provider itself makes (to
+			// a home institution, say), and dropping form-action would let
+			// injected markup post a form anywhere.
+			s.render(w, http.StatusOK, "message", messagePage{base: s.base(r, "Signed out"), Heading: "Signed out",
+				Text: "Your session has ended.", LinkHref: login, LinkText: "Sign in to continue"})
+			return nil
+		}
+		http.Redirect(w, r, login, http.StatusSeeOther)
 		return nil
 	}
 	s.message(w, r, http.StatusForbidden, "Signed out", "Your session has ended. Sign in and try again.")
@@ -155,7 +180,7 @@ func (s *Server) checkPost(w http.ResponseWriter, r *http.Request, sess *session
 		s.message(w, r, http.StatusBadRequest, "Bad request", "The form could not be read.")
 		return false
 	}
-	if !sameOrigin(r, s.origin) || !csrfOK(r, sess) {
+	if !sameOrigin(r, s.cfg.PublicURL) || !csrfOK(r, sess) {
 		s.message(w, r, http.StatusForbidden, "Request refused", "The form did not come from this page. Reload the page and try again.")
 		return false
 	}
@@ -181,11 +206,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	verifier := oauth2.GenerateVerifier()
-	if err := s.sessions.saveLogin(r.Context(), state, verifier, next); err != nil {
-		s.log.Error("webui: recording login", "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
+	s.logins.save(state, verifier, next)
 	// The state is bound to this browser: the callback must present it
 	// both in the URL and in this cookie.
 	s.setCookie(w, loginCookie, state, int(loginTTL/time.Second))
@@ -204,15 +225,12 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if state == "" || code == "" || bound == "" || !secret.Equal(state, bound) {
-		s.log.Warn("webui: login callback with a missing or mismatched state", "client", clientIP(r))
+		s.log.Warn("webui: login callback with a missing or mismatched state", "client", s.clientIP(r))
 		s.message(w, r, http.StatusBadRequest, "Sign-in failed", "This sign-in did not start in this browser, or took too long. Start again.")
 		return
 	}
-	verifier, next, err := s.sessions.takeLogin(r.Context(), state)
-	if err != nil {
-		if !errors.Is(err, errNoSession) {
-			s.log.Error("webui: reading login", "err", err)
-		}
+	verifier, next, ok := s.logins.take(state)
+	if !ok {
 		s.message(w, r, http.StatusBadRequest, "Sign-in failed", "This sign-in expired or was already used. Start again.")
 		return
 	}
@@ -243,7 +261,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setCookie(w, sessionCookie, sid, 0)
-	s.log.Info("webui: signed in", "principal", id.Principal, "client", clientIP(r))
+	s.log.Info("webui: signed in", "principal", id.Principal, "client", s.clientIP(r))
 	if !safeNext(next) {
 		next = "/approve"
 	}
@@ -341,13 +359,6 @@ func (s *Server) lookupRequest(w http.ResponseWriter, r *http.Request, sess *ses
 	return nil
 }
 
-func utc(t time.Time) string {
-	if t.IsZero() {
-		return "an unknown time"
-	}
-	return t.UTC().Format("2006-01-02 15:04 UTC")
-}
-
 func (s *Server) handleApprovePage(w http.ResponseWriter, r *http.Request) {
 	sess := s.requireLogin(w, r)
 	if sess == nil {
@@ -403,12 +414,12 @@ func (s *Server) handleApproveDecision(w http.ResponseWriter, r *http.Request) {
 	}
 	if !d.Allowed {
 		s.log.Warn("webui: unauthorized decision refused", "principal", sess.Principal, "name", rec.Name,
-			"code", code, "client", clientIP(r))
+			"code", code, "authorization", d.Audit(), "client", s.clientIP(r))
 		s.message(w, r, http.StatusForbidden, "Not authorized", "You are not authorized to approve "+rec.Name+". "+d.Reason)
 		return
 	}
 	who := approver(sess)
-	if err := s.cfg.Store.Decide(r.Context(), rec.Number, approve, who, d.Reason); err != nil {
+	if err := s.cfg.Store.Decide(r.Context(), rec.Number, approve, who, d.Audit()); err != nil {
 		if errors.Is(err, registrar.ErrNotPending) {
 			http.Redirect(w, r, "/approve?code="+url.QueryEscape(code), http.StatusSeeOther)
 			return
@@ -422,7 +433,7 @@ func (s *Server) handleApproveDecision(w http.ResponseWriter, r *http.Request) {
 		verb = "approved"
 	}
 	s.log.Info("registrar: request "+verb+" in the web UI", "request", rec.Number, "name", rec.Name, "code", code,
-		"by", who.String(), "authorization", d.Reason, "client", clientIP(r))
+		"by", who.String(), "authorization", d.Audit(), "client", s.clientIP(r))
 	http.Redirect(w, r, "/approve?code="+url.QueryEscape(code), http.StatusSeeOther)
 }
 
@@ -458,15 +469,23 @@ type regRow struct {
 	CanRevoke bool
 }
 
-// visible reports whether sess may see (and so revoke) reg: administrators
-// see every registration, others the ones they approved or are authorized
-// for.
-func (s *Server) visible(ctx context.Context, sess *session, admin bool, reg *registrar.RegistrationRecord) bool {
-	if admin || reg.Approver == approver(sess).String() {
-		return true
+// access is what a user may do with one registration.
+type access struct {
+	see, revoke bool
+	// err is set when authorization could not be checked.
+	err error
+}
+
+// accessTo reports what sess may do with reg: administrators see and
+// revoke every registration; others revoke the ones they are authorized
+// for now, and also see the ones they approved.
+func (s *Server) accessTo(ctx context.Context, sess *session, admin bool, reg *registrar.RegistrationRecord) access {
+	if admin {
+		return access{see: true, revoke: true}
 	}
 	d, err := s.cfg.Authz.Decide(ctx, sess.Principal, reg.Name)
-	return err == nil && d.Allowed
+	authorized := err == nil && d.Allowed
+	return access{see: authorized || reg.Approver == approver(sess).String(), revoke: authorized, err: err}
 }
 
 func approverText(a string) string {
@@ -497,15 +516,16 @@ func (s *Server) handleRegistrations(w http.ResponseWriter, r *http.Request) {
 	admin := s.cfg.Authz.IsAdmin(sess.Principal)
 	page := registrationsPage{base: s.base(r, "Registrations")}
 	for _, reg := range regs {
-		if !s.visible(r.Context(), sess, admin, reg) {
+		acc := s.accessTo(r.Context(), sess, admin, reg)
+		if !acc.see {
 			continue
 		}
 		page.Rows = append(page.Rows, regRow{Reg: reg, Approver: approverText(reg.Approver),
-			CanRevoke: reg.Status != registrar.RegRevoked})
+			CanRevoke: acc.revoke && reg.Status != registrar.RegRevoked})
 	}
 	if id := r.URL.Query().Get("revoked"); id != "" {
 		if reg, err := s.cfg.Store.Registration(r.Context(), id); err == nil && reg.Status == registrar.RegRevoked &&
-			s.visible(r.Context(), sess, admin, reg) {
+			s.accessTo(r.Context(), sess, admin, reg).see {
 			page.Revoked = reg
 		}
 	}
@@ -520,8 +540,24 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	id := r.PostFormValue("id")
 	reg, err := s.cfg.Store.Registration(r.Context(), id)
 	admin := s.cfg.Authz.IsAdmin(sess.Principal)
-	if err != nil || !s.visible(r.Context(), sess, admin, reg) {
+	var acc access
+	if err == nil {
+		acc = s.accessTo(r.Context(), sess, admin, reg)
+	}
+	if !acc.see {
 		s.message(w, r, http.StatusNotFound, "Unknown registration", "No registration you can manage has that id.")
+		return
+	}
+	if acc.err != nil {
+		s.log.Error("webui: authorization check failed", "principal", sess.Principal, "name", reg.Name, "err", acc.err)
+		s.message(w, r, http.StatusServiceUnavailable, "Authorization unavailable",
+			"Your authorization for "+reg.Name+" could not be checked. Nothing was changed. Try again later.")
+		return
+	}
+	if !acc.revoke {
+		s.log.Warn("webui: unauthorized revocation refused", "principal", sess.Principal, "registration", reg.ID,
+			"name", reg.Name, "client", s.clientIP(r))
+		s.message(w, r, http.StatusForbidden, "Not authorized", "You are not authorized to revoke the registration of "+reg.Name+".")
 		return
 	}
 	who := approver(sess)
@@ -532,6 +568,6 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.log.Warn("registrar: registration revoked in the web UI", "registration", reg.ID, "name", reg.Name,
-		"by", who.String(), "client", clientIP(r))
+		"by", who.String(), "client", s.clientIP(r))
 	http.Redirect(w, r, "/registrations?revoked="+url.QueryEscape(reg.ID), http.StatusSeeOther)
 }

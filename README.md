@@ -160,13 +160,17 @@ used as identity.
   within a minute, and on `condor_reconfig`.
 - `HTTP_ADDR`: a plain-HTTP listener on a loopback address (e.g.
   `127.0.0.1:8080`) for a reverse proxy that terminates TLS. The proxy must
-  set `X-Forwarded-For`; on this listener its last entry is the address
-  requests are rate-limited by, and it is used for nothing else.
+  set `X-Forwarded-For`; on this listener, for connections from a trusted
+  proxy, its nearest entry that is not a trusted proxy is the address
+  requests are rate-limited by. It is used for nothing else.
+- `TRUSTED_PROXIES`: addresses or CIDR prefixes of those proxies; default
+  `127.0.0.1, ::1`.
 - `PUBLIC_URL`: required; the `https://` origin browsers and CEs use, with no
-  path (`http://` only for a loopback host).
+  path (`http://` only for a loopback host). It is used in lower case and
+  without a default port (`:443`).
 - `OIDC_ISSUER`: the provider's issuer URL, read via
-  `/.well-known/openid-configuration`. Register `<PUBLIC_URL>/oidc/callback`
-  as the client's redirect URI.
+  `/.well-known/openid-configuration`. Register `<PUBLIC_URL>/oidc/callback`,
+  in that form, as the client's redirect URI.
 - `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET_FILE` (may be root-only; re-read on
   reconfig).
 - `OIDC_SCOPES`: default `openid email profile`. CILogon needs
@@ -174,20 +178,27 @@ used as identity.
 - `OIDC_PRINCIPAL_CLAIM`: default `sub`. Configuration (`ADMINS`, the
   mapfile) names a user by this claim's value. With `sub`, the registrar
   records a user as `<issuer>,<sub>`, and a recorded user matches
-  configuration only while `OIDC_ISSUER` is still that issuer. For OSG
-  Topology, set `osgid`.
+  configuration only while `OIDC_ISSUER` is still that issuer. Any other
+  claim is used as its bare value, with no issuer attached and no
+  verification check, so it must be an identifier that the configured
+  provider issues and never reassigns, such as `osgid`; for OSG Topology,
+  set `osgid`. It must never be `email`, and the daemon refuses to start
+  with `email`.
 - `ADMINS`: registrar administrators, a comma- or space-separated list of
   users by `OIDC_PRINCIPAL_CLAIM` value. They may approve any name, and see
   and revoke every registration. Re-read on reconfig.
 - `SESSION_IDLE` (1 h), `SESSION_LIFETIME` (12 h). Sessions are kept in the
-  registrar's database.
+  registrar's database; sign-ins in progress are kept in memory, so a
+  restart asks those users to sign in again.
 
 Pages: `/approve` (enter a code, or `/approve?code=XXXX-XXXX`: the request's
-CE name, code, source address and its reverse DNS, time and CE version, and
+CE name, code, source address and its reverse DNS, time, the version of
+htc-registrationd the CE runs, and
 whether the logged-in user may approve it and why), `/registrations` (the
 registrations the user approved or is authorized for, all of them for an
-administrator, with revoke), `/healthz`. Login and approve requests are
-rate-limited per client address.
+administrator; revoking one takes current authorization for its name, or
+being an administrator), `/healthz`. Login and approve requests are
+rate-limited per client address (per /64 for IPv6).
 
 ### Authorization backends (registrar)
 
@@ -207,7 +218,13 @@ OIDC /^ops-[0-9]+$/                                 ce2.example.edu
 ```
 
 A regular expression is written between slashes, so a `/` inside it is
-written `\/`. A name is literal or a `path.Match` glob (`*` also matches
+written `\/`. As in HTCondor, it is searched for anywhere in the user, not
+matched against the whole of it, so anchor it with `^` and `$`:
+`/ops-[0-9]+/` also matches `evil-ops-1-x`, while `/^ops-[0-9]+$/` matches
+only `ops-` and digits. `\1` through `\9` in the CE names are replaced by
+the regular expression's groups (`\0` by the whole match); a user whose
+substituted text holds a comma, `*`, `?`, `[` or `\` is allowed nothing
+by that line. A name is literal or a `path.Match` glob (`*` also matches
 dots); names compare without regard to case. As in any HTCondor map file, only the first
 line whose user matches is used, so list all of a user's names on
 that line. Only literal names are known for callback mode: a glob can approve
@@ -220,13 +237,18 @@ error is logged.
 FQDN of an active resource with a CE service and the user's principal (the
 `osgid` claim: set `OIDC_PRINCIPAL_CLAIM = osgid`) is the `CILogonID` of a
 contact in any of its Administrative Contact lists (Primary, Secondary or
-Tertiary). A name is known when it is an active CE's FQDN.
+Tertiary). A name is known when it is an active CE's FQDN. A contact
+listed without a `CILogonID` can never approve.
 
 - `TOPOLOGY_URL`: default `https://topology.opensciencegrid.org` (https only).
+- `TOPOLOGY_INCLUDE_ITB`: default false: production resources only. When
+  true, ITB resources are included too.
 - `TOPOLOGY_REFRESH`: default 15 min.
 - `TOPOLOGY_MAX_STALE`: default 24 h. When fetches fail, the last good copy
   is used until it is this old; after that every decision fails until a fetch
-  succeeds.
+  succeeds. A document listing no active CE, or fewer than half the active
+  CEs of the copy in use, counts as a failed fetch and is logged as an
+  error; a restart accepts it.
 
 ### Command line
 

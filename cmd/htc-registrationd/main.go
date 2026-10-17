@@ -454,7 +454,7 @@ func setupCE(ctx context.Context, d *daemon.Daemon, cfg *config.Config, srv *ced
 		StateDir:            dir,
 		TokenFile:           tokenFile,
 		Limits:              knobs.String(cfg, "HTC_REGISTRATIOND_TOKEN_LIMITS", "ADVERTISE_SCHEDD"),
-		Version:             daemon.CondorVersion() + " htc-registrationd/" + version,
+		Version:             version,
 		CallbackAddress: func() (string, error) {
 			if a := knobs.String(cfg, "HTC_REGISTRATIOND_CALLBACK_ADDRESS", ""); a != "" {
 				return a, nil

@@ -1,8 +1,11 @@
 package webui
 
 import (
+	"container/list"
+	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
@@ -14,7 +17,9 @@ import (
 )
 
 // contentSecurityPolicy allows the page's own stylesheet and nothing else:
-// no script, no frames, forms posting only to this origin.
+// no script, no frames, forms submitting only to this origin (and, since
+// form-action also governs redirects, never redirected elsewhere: see
+// requireLogin).
 const contentSecurityPolicy = "default-src 'none'; style-src 'self'; img-src 'self'; " +
 	"form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
 
@@ -37,47 +42,95 @@ func withHeaders(next http.Handler) http.Handler {
 	})
 }
 
+// DefaultTrustedProxies are the reverse proxies whose X-Forwarded-For is
+// read when HTC_REGISTRATIOND_TRUSTED_PROXIES is not set.
+var DefaultTrustedProxies = []string{"127.0.0.1", "::1"}
+
+// parseProxies reads addresses and CIDR prefixes.
+func parseProxies(list []string) ([]netip.Prefix, error) {
+	out := make([]netip.Prefix, 0, len(list))
+	for _, v := range list {
+		if p, err := netip.ParsePrefix(v); err == nil {
+			out = append(out, p.Masked())
+			continue
+		}
+		a, err := netip.ParseAddr(v)
+		if err != nil {
+			return nil, fmt.Errorf("HTC_REGISTRATIOND_TRUSTED_PROXIES: %q is not an address or prefix", v)
+		}
+		a = a.Unmap()
+		out = append(out, netip.PrefixFrom(a, a.BitLen()))
+	}
+	return out, nil
+}
+
+func trustedProxy(a netip.Addr, proxies []netip.Prefix) bool {
+	for _, p := range proxies {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
+}
+
 // clientIP is the address requests are rate-limited by. On the plain-HTTP
-// listener, which accepts only loopback connections from a reverse proxy,
-// it is the last X-Forwarded-For entry (the one the proxy added); the
-// header is never used for anything else, and never on the HTTPS listener.
-func clientIP(r *http.Request) string {
+// listener, when the connection comes from a trusted proxy, it is the
+// nearest X-Forwarded-For hop that is not itself a trusted proxy; the
+// header is never used for anything else, and never on the HTTPS
+// listener.
+func clientIP(r *http.Request, proxies []netip.Prefix) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
 	}
-	ip := net.ParseIP(host)
-	if r.TLS == nil && ip != nil && ip.IsLoopback() {
-		if xff := r.Header.Values("X-Forwarded-For"); len(xff) > 0 {
-			parts := strings.Split(xff[len(xff)-1], ",")
-			if fwd := net.ParseIP(strings.TrimSpace(parts[len(parts)-1])); fwd != nil {
-				return fwd.String()
-			}
+	peer, err := netip.ParseAddr(host)
+	if err != nil {
+		return host
+	}
+	client := peer.WithZone("").Unmap()
+	if r.TLS != nil || !trustedProxy(client, proxies) {
+		return client.String()
+	}
+	var hops []string
+	for _, v := range r.Header.Values("X-Forwarded-For") {
+		hops = append(hops, strings.Split(v, ",")...)
+	}
+	for i := len(hops) - 1; i >= 0; i-- {
+		a, err := netip.ParseAddr(strings.TrimSpace(hops[i]))
+		if err != nil {
+			break
+		}
+		client = a.WithZone("").Unmap()
+		if !trustedProxy(client, proxies) {
+			break
 		}
 	}
-	if ip != nil {
-		return ip.String()
-	}
-	return host
+	return client.String()
 }
 
-// ipLimiter is a token bucket per client address.
+func (s *Server) clientIP(r *http.Request) string { return clientIP(r, s.cfg.TrustedProxies) }
+
+// ipLimiter is a token bucket per client network: the address for IPv4,
+// its /64 for IPv6, since one host commonly holds a whole /64.
 type ipLimiter struct {
 	limit rate.Limit
 	burst int
 	now   func() time.Time
+	max   int
 
 	mu      sync.Mutex
-	clients map[string]*limiterEntry
+	clients map[string]*list.Element
+	// lru holds *limiterEntry, least recently seen first.
+	lru *list.List
 }
 
 type limiterEntry struct {
-	l    *rate.Limiter
-	seen time.Time
+	key string
+	l   *rate.Limiter
 }
 
-// maxLimiterClients bounds the limiter's memory; idle entries are dropped
-// first.
+// maxLimiterClients bounds the limiter's memory; when it is full the
+// least recently seen network is forgotten.
 const maxLimiterClients = 10000
 
 func newIPLimiter(perMinute, burst int, now func() time.Time) *ipLimiter {
@@ -85,31 +138,48 @@ func newIPLimiter(perMinute, burst int, now func() time.Time) *ipLimiter {
 		limit:   rate.Limit(float64(perMinute) / 60),
 		burst:   burst,
 		now:     now,
-		clients: map[string]*limiterEntry{},
+		max:     maxLimiterClients,
+		clients: map[string]*list.Element{},
+		lru:     list.New(),
 	}
 }
 
+// limiterKey is the network ip is limited as: the address for IPv4
+// (including IPv4-mapped IPv6), the /64 for IPv6. Anything else is used
+// as it is.
+func limiterKey(ip string) string {
+	a, err := netip.ParseAddr(ip)
+	if err != nil {
+		return ip
+	}
+	a = a.Unmap()
+	if a.Is4() {
+		return a.String()
+	}
+	p, err := a.WithZone("").Prefix(64)
+	if err != nil {
+		return ip
+	}
+	return p.String()
+}
+
 func (l *ipLimiter) allow(ip string) bool {
+	key := limiterKey(ip)
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	now := l.now()
-	e := l.clients[ip]
-	if e == nil {
-		if len(l.clients) >= maxLimiterClients {
-			for k, v := range l.clients {
-				if now.Sub(v.seen) > 10*time.Minute {
-					delete(l.clients, k)
-				}
-			}
-			if len(l.clients) >= maxLimiterClients {
-				l.clients = map[string]*limiterEntry{}
-			}
+	el := l.clients[key]
+	if el == nil {
+		for l.lru.Len() >= l.max {
+			oldest := l.lru.Front()
+			l.lru.Remove(oldest)
+			delete(l.clients, oldest.Value.(*limiterEntry).key)
 		}
-		e = &limiterEntry{l: rate.NewLimiter(l.limit, l.burst)}
-		l.clients[ip] = e
+		el = l.lru.PushBack(&limiterEntry{key: key, l: rate.NewLimiter(l.limit, l.burst)})
+		l.clients[key] = el
+	} else {
+		l.lru.MoveToBack(el)
 	}
-	e.seen = now
-	return e.l.AllowN(now, 1)
+	return el.Value.(*limiterEntry).l.AllowN(l.now(), 1)
 }
 
 // safeNext reports whether next is a same-origin path to return to after
@@ -129,7 +199,7 @@ func safeNext(next string) bool {
 }
 
 // sameOrigin checks a state-changing request's Origin (when the browser
-// sends one) against the public URL.
+// sends one) against the public URL's canonical origin.
 func sameOrigin(r *http.Request, origin string) bool {
 	o := r.Header.Get("Origin")
 	return o == "" || o == origin

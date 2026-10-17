@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
@@ -42,7 +43,9 @@ type Resolver interface {
 type Config struct {
 	// PublicURL is the origin browsers and CEs use, e.g.
 	// https://registrar.example.org. Redirect URIs and the verification
-	// URI are built from it.
+	// URI are built from it, and a form's Origin must match it. It is used
+	// in the form browsers send as Origin: scheme and host in lower case,
+	// without the scheme's default port.
 	PublicURL string
 	// HTTPSAddr, with CertFile and KeyFile, is the HTTPS listener.
 	HTTPSAddr string
@@ -51,6 +54,9 @@ type Config struct {
 	// HTTPAddr is a plain-HTTP listener on a loopback address, for a
 	// reverse proxy that terminates TLS.
 	HTTPAddr string
+	// TrustedProxies are the proxies whose X-Forwarded-For is read on the
+	// HTTPAddr listener (default DefaultTrustedProxies).
+	TrustedProxies []netip.Prefix
 
 	OIDC OIDCConfig
 	// ClientSecretFile holds the OIDC client secret; it is read with
@@ -94,7 +100,17 @@ func FromConfig(cfg knobs.Getter) (*Config, error) {
 			PrincipalClaim: knobs.String(cfg, "HTC_REGISTRATIOND_OIDC_PRINCIPAL_CLAIM", "sub"),
 		},
 	}
+	// Configuration names users by this claim's bare value, with no issuer
+	// and no check that an address was verified, so it must be an
+	// identifier the provider never reassigns.
+	if strings.EqualFold(strings.TrimSpace(c.OIDC.PrincipalClaim), "email") {
+		return nil, errors.New("HTC_REGISTRATIOND_OIDC_PRINCIPAL_CLAIM must not be email: use sub, or an identifier " +
+			"the provider never reassigns, such as osgid")
+	}
 	var err error
+	if c.TrustedProxies, err = parseProxies(knobs.List(cfg, "HTC_REGISTRATIOND_TRUSTED_PROXIES", DefaultTrustedProxies)); err != nil {
+		return nil, err
+	}
 	if c.SessionIdle, err = knobs.Duration(cfg, "HTC_REGISTRATIOND_SESSION_IDLE", time.Hour); err != nil {
 		return nil, err
 	}
@@ -104,7 +120,32 @@ func FromConfig(cfg knobs.Getter) (*Config, error) {
 	if !c.Enabled() {
 		return c, nil
 	}
-	return c, c.validate()
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
+	c.PublicURL, _ = canonicalOrigin(c.PublicURL)
+	return c, nil
+}
+
+// canonicalOrigin returns rawURL's origin as a browser serializes it for
+// the Origin header: scheme and host in lower case, without the scheme's
+// default port, with no path.
+func canonicalOrigin(rawURL string) (string, error) {
+	u, err := url.Parse(strings.TrimRight(rawURL, "/"))
+	if err != nil || u.Host == "" {
+		return "", fmt.Errorf("webui: bad public URL %q", rawURL)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	host, port := strings.ToLower(u.Hostname()), u.Port()
+	if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
+		port = ""
+	}
+	if port != "" {
+		host = net.JoinHostPort(host, port)
+	} else if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	return scheme + "://" + host, nil
 }
 
 func isLoopbackHost(host string) bool {
@@ -159,6 +200,7 @@ type Server struct {
 	cfg      Config
 	log      *slog.Logger
 	sessions *sessionStore
+	logins   *loginStore
 	oidc     *oidcProvider
 	certs    *certReloader
 	pages    *pages
@@ -166,7 +208,6 @@ type Server struct {
 	loginLimit   *ipLimiter
 	approveLimit *ipLimiter
 	secure       bool
-	origin       string
 	handler      http.Handler
 }
 
@@ -194,17 +235,20 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	if cfg.Resolver == nil {
 		cfg.Resolver = net.DefaultResolver
 	}
+	if cfg.TrustedProxies == nil {
+		cfg.TrustedProxies, _ = parseProxies(DefaultTrustedProxies)
+	}
 	if cfg.SessionIdle <= 0 {
 		cfg.SessionIdle = time.Hour
 	}
 	if cfg.SessionLifetime <= 0 {
 		cfg.SessionLifetime = 12 * time.Hour
 	}
-	cfg.PublicURL = strings.TrimRight(cfg.PublicURL, "/")
-	pu, err := url.Parse(cfg.PublicURL)
-	if err != nil || pu.Host == "" {
-		return nil, fmt.Errorf("webui: bad public URL %q", cfg.PublicURL)
+	origin, err := canonicalOrigin(cfg.PublicURL)
+	if err != nil {
+		return nil, err
 	}
+	cfg.PublicURL = origin
 	if cfg.ClientSecretFile != "" {
 		if cfg.OIDC.ClientSecret, err = readSecret(cfg.ReadCredential, cfg.ClientSecretFile); err != nil {
 			return nil, err
@@ -222,12 +266,12 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		cfg:          cfg,
 		log:          cfg.Logger,
 		sessions:     sessions,
+		logins:       newLoginStore(cfg.Now, maxPendingLogins),
 		oidc:         newOIDCProvider(cfg.OIDC),
 		pages:        pg,
 		loginLimit:   newIPLimiter(loginPerMinute, loginPerMinute, cfg.Now),
 		approveLimit: newIPLimiter(approvePerMinute, approvePerMinute, cfg.Now),
-		secure:       pu.Scheme == "https",
-		origin:       pu.Scheme + "://" + pu.Host,
+		secure:       strings.HasPrefix(origin, "https://"),
 	}
 	if cfg.HTTPSAddr != "" {
 		if s.certs, err = newCertReloader(cfg.CertFile, cfg.KeyFile, cfg.ReadCredential, s.log); err != nil {

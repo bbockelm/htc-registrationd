@@ -3,12 +3,14 @@ package webui
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -196,7 +198,7 @@ func (h *harness) pending(name, code string) {
 		Name:          name,
 		Method:        protocol.MethodApproval,
 		SourceIP:      "192.0.2.10",
-		CEVersion:     "$CondorVersion: 25.0.0 2026-01-01 $ htc-registrationd/test",
+		CEVersion:     "0.3.0-test",
 		UserCode:      code,
 		Status:        registrar.ReqPending,
 		TTL:           30 * time.Minute,
@@ -234,9 +236,9 @@ func TestLoginThenApprove(t *testing.T) {
 		"192.0.2.10",
 		"ce1.example.edu, which resolves back to this address",
 		"2027-01-15 08:00 UTC", // requested at
-		"htc-registrationd/test",
+		"<dt>CE version</dt><dd>0.3.0-test</dd>",
 		"You are authorized to approve " + testCE,
-		"mapfile line 1",
+		"Allowed by the registrar&#39;s map file",
 		`value="approve"`,
 		"Alice Admin",
 		// The footer names the user as configuration does: the subject.
@@ -248,6 +250,9 @@ func TestLoginThenApprove(t *testing.T) {
 	}
 	if strings.Contains(body, h.idp.URL()+",alice") {
 		t.Error("approve page shows the issuer-qualified principal")
+	}
+	if strings.Contains(body, "line 1") || strings.Contains(body, h.mapf) {
+		t.Error("approve page shows where in the map file the user is listed")
 	}
 	if h.idp.pkceRejections != 0 || len(h.idp.challenges) != 1 {
 		t.Errorf("PKCE: %d challenges, %d rejections", len(h.idp.challenges), h.idp.pkceRejections)
@@ -268,7 +273,7 @@ func TestLoginThenApprove(t *testing.T) {
 		t.Fatalf("after approving: %d\n%s", code, body)
 	}
 	r := h.status("BCDF-GHJK")
-	if r.Status != registrar.ReqApproved || r.DecidedBy != "oidc:"+h.idp.URL()+",alice" || r.Reason != "mapfile line 1" {
+	if r.Status != registrar.ReqApproved || r.DecidedBy != "oidc:"+h.idp.URL()+",alice" || r.Reason != "Allowed by the registrar's map file ("+h.mapf+" line 1)" {
 		t.Fatalf("request after approval: %+v", r)
 	}
 
@@ -301,7 +306,7 @@ func TestUnauthorizedUserGetsNoButtons(t *testing.T) {
 	h.login(c, "mallory")
 	body, code := h.get(c, "/approve?code=DDDD-FFFF")
 	if code != http.StatusOK || !strings.Contains(body, "You are not authorized to approve "+testCE) ||
-		!strings.Contains(body, "No mapfile line matches your identity") {
+		!strings.Contains(body, "The registrar&#39;s map file does not name you") {
 		t.Fatalf("%d\n%s", code, body)
 	}
 	if strings.Contains(body, `value="approve"`) || strings.Contains(body, `value="deny"`) {
@@ -474,9 +479,12 @@ func TestPKCEVerifierIsChecked(t *testing.T) {
 	c.CheckRedirect = func(req *http.Request, _ []*http.Request) error {
 		// Swap the stored verifier just before the callback is handled.
 		if req.URL.Path == "/oidc/callback" {
-			if _, err := h.store.DB().ExecContext(context.Background(), `UPDATE web_logins SET verifier = 'wrong-verifier-wrong-verifier-wrong-verifier'`); err != nil {
-				t.Fatal(err)
+			l := h.srv.logins
+			l.mu.Lock()
+			for e := l.order.Front(); e != nil; e = e.Next() {
+				e.Value.(*pendingLogin).verifier = "wrong-verifier-wrong-verifier-wrong-verifier"
 			}
+			l.mu.Unlock()
 		}
 		return nil
 	}
@@ -701,6 +709,25 @@ func TestRegistrationsAndRevoke(t *testing.T) {
 	if r, _ := h.store.Registration(context.Background(), other); r.Status != registrar.RegActive {
 		t.Fatal("revoked the wrong registration")
 	}
+
+	// alice loses her map file line: she still sees what she approved, but
+	// may no longer revoke it.
+	if err := os.WriteFile(h.mapf, []byte("OIDC someone-else "+testCE+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.mf.Reload(""); err != nil {
+		t.Fatal(err)
+	}
+	body, _ = h.get(c, "/registrations")
+	if !strings.Contains(body, testCE) || strings.Contains(body, `value="`+byAlice+`"`) {
+		t.Fatalf("former approver's view:\n%s", body)
+	}
+	if _, code := h.post(c, "/registrations/revoke", url.Values{"csrf": {csrfFrom(t, body)}, "id": {byAlice}}, nil); code != http.StatusForbidden {
+		t.Fatalf("former approver revoked: %d", code)
+	}
+	if r, _ := h.store.Registration(context.Background(), byAlice); r.Status != registrar.RegActive {
+		t.Fatal("a former approver revoked a registration")
+	}
 }
 
 func TestSecurityHeaders(t *testing.T) {
@@ -797,20 +824,58 @@ func TestRateLimits(t *testing.T) {
 	if !l.allow("b") {
 		t.Fatal("buckets are not per address")
 	}
-	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil)
-	req.RemoteAddr = "127.0.0.1:5555"
-	req.Header.Add("X-Forwarded-For", "203.0.113.9, 198.51.100.7")
-	if got := clientIP(req); got != "198.51.100.7" {
-		t.Errorf("behind the proxy: %s", got)
+}
+
+func TestClientIPTrustedProxies(t *testing.T) {
+	def, err := parseProxies(DefaultTrustedProxies)
+	if err != nil {
+		t.Fatal(err)
 	}
-	req.TLS = &tls.ConnectionState{}
-	if got := clientIP(req); got != "127.0.0.1" {
-		t.Errorf("HTTPS listener trusted X-Forwarded-For: %s", got)
+	custom, err := parseProxies([]string{"127.0.0.1", "10.0.0.0/8"})
+	if err != nil {
+		t.Fatal(err)
 	}
-	req.TLS = nil
-	req.RemoteAddr = "192.0.2.1:5555"
-	if got := clientIP(req); got != "192.0.2.1" {
-		t.Errorf("non-loopback peer trusted X-Forwarded-For: %s", got)
+	for _, tc := range []struct {
+		desc    string
+		proxies []netip.Prefix
+		peer    string
+		xff     []string
+		tls     bool
+		want    string
+	}{
+		{"behind the proxy", def, "127.0.0.1:5555", []string{"203.0.113.9, 198.51.100.7"}, false, "198.51.100.7"},
+		{"IPv6 loopback proxy", def, "[::1]:5555", []string{"198.51.100.7"}, false, "198.51.100.7"},
+		{"a trusted hop is skipped", def, "127.0.0.1:5555", []string{"198.51.100.7, 127.0.0.1"}, false, "198.51.100.7"},
+		{"several headers", def, "127.0.0.1:5555", []string{"203.0.113.9", "198.51.100.7"}, false, "198.51.100.7"},
+		{"trusted chain", custom, "127.0.0.1:5555", []string{"203.0.113.9, 198.51.100.7, 10.1.2.3"}, false, "198.51.100.7"},
+		{"forged hop past the last untrusted one", custom, "127.0.0.1:5555", []string{"10.9.9.9, 198.51.100.7, 10.1.2.3"}, false, "198.51.100.7"},
+		{"unparsable hop", def, "127.0.0.1:5555", []string{"198.51.100.7, garbage"}, false, "127.0.0.1"},
+		{"no header", def, "127.0.0.1:5555", nil, false, "127.0.0.1"},
+		{"HTTPS listener", def, "127.0.0.1:5555", []string{"198.51.100.7"}, true, "127.0.0.1"},
+		{"untrusted peer", def, "192.0.2.1:5555", []string{"198.51.100.7"}, false, "192.0.2.1"},
+		{"loopback outside the list", def, "127.0.0.2:5555", []string{"198.51.100.7"}, false, "127.0.0.2"},
+	} {
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil)
+		req.RemoteAddr = tc.peer
+		for _, v := range tc.xff {
+			req.Header.Add("X-Forwarded-For", v)
+		}
+		if tc.tls {
+			req.TLS = &tls.ConnectionState{}
+		}
+		if got := clientIP(req, tc.proxies); got != tc.want {
+			t.Errorf("%s: %s, want %s", tc.desc, got, tc.want)
+		}
+	}
+	if _, err := parseProxies([]string{"proxy.example.org"}); err == nil {
+		t.Error("a host name was accepted as a proxy")
+	}
+	c, err := FromConfig(knobs.Map{"HTC_REGISTRATIOND_TRUSTED_PROXIES": "192.0.2.5, 2001:db8::/32"})
+	if err != nil || len(c.TrustedProxies) != 2 || !trustedProxy(netip.MustParseAddr("2001:db8::7"), c.TrustedProxies) {
+		t.Errorf("TRUSTED_PROXIES: %v, %v", c, err)
+	}
+	if _, err := FromConfig(knobs.Map{"HTC_REGISTRATIOND_TRUSTED_PROXIES": "nope"}); err == nil {
+		t.Error("a bad TRUSTED_PROXIES was accepted")
 	}
 }
 
@@ -850,10 +915,18 @@ func TestFromConfig(t *testing.T) {
 		"public HTTP":         with("HTC_REGISTRATIOND_HTTP_ADDR", "0.0.0.0:8080"),
 		"wildcard HTTP":       with("HTC_REGISTRATIOND_HTTP_ADDR", ":8080"),
 		"bad session timeout": with("HTC_REGISTRATIOND_SESSION_IDLE", "soon"),
+		"email principal":     with("HTC_REGISTRATIOND_OIDC_PRINCIPAL_CLAIM", "email"),
+		"Email principal":     with("HTC_REGISTRATIOND_OIDC_PRINCIPAL_CLAIM", "Email"),
+		// Even with the web UI off.
+		"email, no listener": {"HTC_REGISTRATIOND_OIDC_PRINCIPAL_CLAIM": "email"},
 	} {
 		if _, err := FromConfig(m); err == nil {
 			t.Errorf("%s: accepted", desc)
 		}
+	}
+	if c, err := FromConfig(with("HTC_REGISTRATIOND_PUBLIC_URL", "HTTPS://Registrar.Example.org:443")); err != nil ||
+		c.VerificationURI() != "https://registrar.example.org/approve" {
+		t.Errorf("non-canonical public URL: %v", err)
 	}
 	if _, err := FromConfig(with("HTC_REGISTRATIOND_HTTP_ADDR", "127.0.0.1:8080")); err != nil {
 		t.Errorf("loopback HTTP: %v", err)
@@ -865,5 +938,259 @@ func TestFromConfig(t *testing.T) {
 		"HTC_REGISTRATIOND_OIDC_CLIENT_ID": "cid",
 	}); err != nil {
 		t.Errorf("loopback-only setup: %v", err)
+	}
+}
+
+func TestLoginStartWritesNothingToTheDatabase(t *testing.T) {
+	h := newHarness(t)
+	c := h.browser()
+	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	db := h.store.DB()
+	var before, after int
+	if err := db.QueryRowContext(context.Background(), `SELECT count(*) FROM web_sessions`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	for range 5 {
+		if _, code := h.get(c, "/login"); code != http.StatusFound {
+			t.Fatalf("login: %d", code)
+		}
+	}
+	if err := db.QueryRowContext(context.Background(), `SELECT count(*) FROM web_sessions`).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	var tables int
+	if err := db.QueryRowContext(context.Background(),
+		`SELECT count(*) FROM sqlite_master WHERE name = 'web_logins'`).Scan(&tables); err != nil {
+		t.Fatal(err)
+	}
+	if before != after || tables != 0 || h.srv.logins.len() != 5 {
+		t.Fatalf("sessions %d -> %d, web_logins tables %d, logins in memory %d", before, after, tables, h.srv.logins.len())
+	}
+}
+
+func TestLoginStoreIsBounded(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+	l := newLoginStore(clock.Now, 3)
+	for _, st := range []string{"a", "b", "c", "d"} {
+		l.save(st, "v-"+st, "/"+st)
+	}
+	if l.len() != 3 {
+		t.Fatalf("holding %d logins, want 3", l.len())
+	}
+	if _, _, ok := l.take("a"); ok {
+		t.Error("the oldest login was not dropped")
+	}
+	if v, next, ok := l.take("d"); !ok || v != "v-d" || next != "/d" {
+		t.Errorf("newest login: %q %q %v", v, next, ok)
+	}
+	if _, _, ok := l.take("d"); ok {
+		t.Error("a login was taken twice")
+	}
+	clock.Advance(loginTTL + time.Second)
+	if _, _, ok := l.take("b"); ok {
+		t.Error("an expired login was taken")
+	}
+	l.save("e", "v-e", "/e")
+	if l.len() != 1 {
+		t.Errorf("expired logins kept: %d held", l.len())
+	}
+}
+
+func TestLimiterNetworks(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+	l := newIPLimiter(1, 1, clock.Now)
+	for _, tc := range []struct {
+		ip    string
+		allow bool
+	}{
+		{"2001:db8:1:2::1", true},
+		{"2001:db8:1:2:ffff::9", false}, // same /64
+		{"2001:db8:1:3::1", true},       // next /64
+		{"192.0.2.1", true},
+		{"::ffff:192.0.2.1", false}, // the same IPv4 address
+		{"192.0.2.2", true},
+	} {
+		if got := l.allow(tc.ip); got != tc.allow {
+			t.Errorf("allow(%s) = %v, want %v", tc.ip, got, tc.allow)
+		}
+	}
+}
+
+func TestLimiterEvictsLeastRecent(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+	l := newIPLimiter(1, 1, clock.Now)
+	l.max = 2
+	l.allow("192.0.2.1") // spends 192.0.2.1's token
+	l.allow("192.0.2.2")
+	if l.allow("192.0.2.1") { // and touches it
+		t.Fatal("192.0.2.1 was not limited")
+	}
+	l.allow("192.0.2.3") // full: forgets 192.0.2.2, the least recent
+	if l.allow("192.0.2.1") {
+		t.Error("a full limiter forgot a recent client")
+	}
+	if len(l.clients) != 2 || l.lru.Len() != 2 {
+		t.Errorf("holding %d/%d clients, want 2", len(l.clients), l.lru.Len())
+	}
+	if !l.allow("192.0.2.2") {
+		t.Error("the evicted client was not forgotten")
+	}
+}
+
+func TestPublicURLIsCanonical(t *testing.T) {
+	for raw, want := range map[string]string{
+		"https://registrar.example.org":         "https://registrar.example.org",
+		"HTTPS://Registrar.Example.ORG:443/":    "https://registrar.example.org",
+		"https://registrar.example.org:8443":    "https://registrar.example.org:8443",
+		"http://LocalHost:80":                   "http://localhost",
+		"http://[::1]:8080":                     "http://[::1]:8080",
+		"https://[2001:DB8::1]:443":             "https://[2001:db8::1]",
+		"https://registrar.example.org:80":      "https://registrar.example.org:80",
+		"http://registrar.example.org:443/path": "http://registrar.example.org:443",
+	} {
+		if got, err := canonicalOrigin(raw); err != nil || got != want {
+			t.Errorf("canonicalOrigin(%q) = %q, %v; want %q", raw, got, err, want)
+		}
+	}
+
+	// A form posted by a browser, whose Origin is canonical, is accepted
+	// when PUBLIC_URL is not written canonically.
+	h := newHarness(t)
+	srv, err := New(context.Background(), Config{
+		PublicURL: "https://Registrar.Example.ORG:443/",
+		OIDC:      OIDCConfig{Issuer: h.idp.URL(), ClientID: h.idp.clientID},
+		Store:     h.store,
+		Authz:     h.policy,
+		Now:       h.clock.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := srv.redirectURL(); got != "https://registrar.example.org/oidc/callback" {
+		t.Errorf("redirect URI %q", got)
+	}
+	id, sess, err := srv.sessions.create(context.Background(), h.idp.URL()+",alice", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Signing out ends the session, so the accepted origin comes last.
+	for _, tc := range []struct {
+		origin string
+		want   int
+	}{
+		{"https://evil.example", http.StatusForbidden},
+		{"https://registrar.example.org:443", http.StatusForbidden}, // browsers never send this
+		{"https://registrar.example.org", http.StatusOK},
+	} {
+		origin, want := tc.origin, tc.want
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/logout",
+			strings.NewReader(url.Values{"csrf": {sess.CSRF}}.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Origin", origin)
+		req.AddCookie(&http.Cookie{Name: "__Host-" + sessionCookie, Value: id, Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode})
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != want {
+			t.Errorf("Origin %s: %d, want %d", origin, rec.Code, want)
+		}
+	}
+}
+
+func TestDiscoveryOutlivesTheBrowserThatStartedIt(t *testing.T) {
+	release := make(chan struct{})
+	var hits atomic.Int32
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"issuer": srv.URL, "authorization_endpoint": srv.URL + "/authorize",
+			"token_endpoint": srv.URL + "/token", "userinfo_endpoint": srv.URL + "/userinfo",
+		})
+	}))
+	t.Cleanup(srv.Close)
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(unblock) // runs before srv.Close, which waits for the handler
+	p := newOIDCProvider(OIDCConfig{Issuer: srv.URL})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	first := make(chan error, 1)
+	go func() {
+		_, err := p.endpoints(ctx)
+		first <- err
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for hits.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("discovery did not start")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// The provider's lock is free while discovery runs.
+	done := make(chan struct{})
+	go func() {
+		p.setSecret("new-secret")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the lock is held across discovery")
+	}
+
+	// The browser that started discovery goes away; it stops waiting...
+	cancel()
+	select {
+	case err := <-first:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled caller: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a canceled caller kept waiting")
+	}
+	// ...but discovery completes, once, for everyone else.
+	unblock()
+	ep, err := p.endpoints(context.Background())
+	if err != nil || ep.AuthURL != srv.URL+"/authorize" {
+		t.Fatalf("after the first browser left: %+v, %v", ep, err)
+	}
+	if n := hits.Load(); n != 1 {
+		t.Errorf("discovery ran %d times", n)
+	}
+}
+
+func TestCodeFormAfterSessionEnds(t *testing.T) {
+	h := newHarness(t)
+	h.pending(testCE, "BCDF-GHJK")
+	c := h.browser()
+	h.login(c, "alice")
+	body, _ := h.get(c, "/approve")
+	if !strings.Contains(body, `name="via" value="form"`) {
+		t.Fatalf("the code form does not mark itself:\n%s", body)
+	}
+	h.clock.Advance(2 * time.Hour)
+	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+	// Submitted from the form: a page with a sign-in link, not a redirect
+	// that form-action 'self' would block on its way to the provider.
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/approve?code=BCDF-GHJK&via=form", nil)
+	rec := httptest.NewRecorder()
+	h.srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Header().Get("Location") != "" {
+		t.Fatalf("signed-out form submission: %d, Location %q", rec.Code, rec.Header().Get("Location"))
+	}
+	if !strings.Contains(rec.Body.String(), `<a href="/login?next=%2Fapprove%3Fcode%3DBCDF-GHJK">Sign in to continue</a>`) {
+		t.Errorf("no sign-in link:\n%s", rec.Body.String())
+	}
+	if csp := rec.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "form-action 'self';") {
+		t.Errorf("CSP %q", csp)
+	}
+
+	// Following a link (the CE's verification URI) still redirects.
+	if _, code := h.get(c, "/approve?code=BCDF-GHJK"); code != http.StatusSeeOther {
+		t.Errorf("signed-out link: %d", code)
 	}
 }

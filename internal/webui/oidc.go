@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"golang.org/x/oauth2"
+	"golang.org/x/sync/singleflight"
 )
 
 // OIDCConfig configures login with an OpenID Connect provider: the
@@ -44,6 +45,9 @@ const maxProviderResponse = 1 << 20
 // discoveryRetry is the least time between two failed discoveries.
 const discoveryRetry = 10 * time.Second
 
+// discoveryTimeout bounds one discovery.
+const discoveryTimeout = 30 * time.Second
+
 type oidcEndpoints struct {
 	Issuer      string `json:"issuer"`
 	AuthURL     string `json:"authorization_endpoint"`
@@ -52,13 +56,15 @@ type oidcEndpoints struct {
 }
 
 type oidcProvider struct {
+	// cfg.ClientSecret is guarded by mu; it changes on reconfig.
 	cfg OIDCConfig
+	// discovery runs one discovery at a time for all callers.
+	discovery singleflight.Group
 
 	mu       sync.Mutex
 	ep       *oidcEndpoints
 	failedAt time.Time
 	lastErr  error
-	secret   string
 }
 
 func newOIDCProvider(cfg OIDCConfig) *oidcProvider {
@@ -71,34 +77,58 @@ func newOIDCProvider(cfg OIDCConfig) *oidcProvider {
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{Timeout: 30 * time.Second}
 	}
-	return &oidcProvider{cfg: cfg, secret: cfg.ClientSecret}
+	return &oidcProvider{cfg: cfg}
 }
 
 // setSecret replaces the client secret (on reconfig).
 func (p *oidcProvider) setSecret(s string) {
 	p.mu.Lock()
-	p.secret = s
+	p.cfg.ClientSecret = s
 	p.mu.Unlock()
 }
 
 // endpoints returns the provider's endpoints, discovering them on first use.
 // A failed discovery is retried, at most once per discoveryRetry.
+//
+// Discovery serves every browser, so it does not run on the requesting
+// browser's context: a browser that goes away does not fail it for the
+// others. A caller whose context ends stops waiting for it, and the lock is
+// not held while it runs.
 func (p *oidcProvider) endpoints(ctx context.Context) (*oidcEndpoints, error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.ep != nil {
-		return p.ep, nil
+	ep, failedAt, lastErr := p.ep, p.failedAt, p.lastErr
+	p.mu.Unlock()
+	if ep != nil {
+		return ep, nil
 	}
-	if !p.failedAt.IsZero() && time.Since(p.failedAt) < discoveryRetry {
-		return nil, p.lastErr
+	if !failedAt.IsZero() && time.Since(failedAt) < discoveryRetry {
+		return nil, lastErr
 	}
-	ep, err := p.discover(ctx)
-	if err != nil {
-		p.failedAt, p.lastErr = time.Now(), err
-		return nil, err
+	ch := p.discovery.DoChan("discover", func() (any, error) {
+		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), discoveryTimeout)
+		defer cancel()
+		ep, err := p.discover(dctx)
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		switch {
+		case err == nil:
+			p.ep = ep
+		case errors.Is(err, context.Canceled):
+			// Not the provider's failure; the next caller tries again.
+		default:
+			p.failedAt, p.lastErr = time.Now(), err
+		}
+		return ep, err
+	})
+	select {
+	case res := <-ch:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		return res.Val.(*oidcEndpoints), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
-	p.ep = ep
-	return ep, nil
 }
 
 func trimSlash(s string) string { return strings.TrimRight(s, "/") }
@@ -153,7 +183,7 @@ func (p *oidcProvider) getJSON(ctx context.Context, u, bearer string, out any) e
 // oauth2Config is the client configuration for one login.
 func (p *oidcProvider) oauth2Config(ep *oidcEndpoints, redirectURL string) *oauth2.Config {
 	p.mu.Lock()
-	secret := p.secret
+	secret := p.cfg.ClientSecret
 	p.mu.Unlock()
 	return &oauth2.Config{
 		ClientID:     p.cfg.ClientID,

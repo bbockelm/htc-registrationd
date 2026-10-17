@@ -16,7 +16,7 @@
           <ContactList>
             <ContactType>Administrative Contact</ContactType>
             <Contacts>
-              <Contact><Name>Primary Admin</Name><CILogonID>http://cilogon.org/serverA/users/111</CILogonID><ContactRank>Primary</ContactRank></Contact>
+              <Contact><Name>Primary Admin</Name><CILogonID>OSG1000111</CILogonID><ContactRank>Primary</ContactRank></Contact>
             </Contacts>
           </ContactList>
         </ContactLists>
@@ -34,14 +34,14 @@
           <ContactList>
             <ContactType>Security Contact</ContactType>
             <Contacts>
-              <Contact><Name>Security Person</Name><CILogonID>http://cilogon.org/serverA/users/333</CILogonID><ContactRank>Primary</ContactRank></Contact>
+              <Contact><Name>Security Person</Name><CILogonID>OSG1000333</CILogonID><ContactRank>Primary</ContactRank></Contact>
             </Contacts>
           </ContactList>
           <ContactList>
             <ContactType>Administrative Contact</ContactType>
             <Contacts>
-              <Contact><Name>Someone Else</Name><CILogonID>http://cilogon.org/serverA/users/222</CILogonID><ContactRank>Primary</ContactRank></Contact>
-              <Contact><Name>Primary Admin</Name><CILogonID>http://cilogon.org/serverA/users/111</CILogonID><ContactRank>Secondary</ContactRank></Contact>
+              <Contact><Name>Someone Else</Name><CILogonID>OSG1000222</CILogonID><ContactRank>Primary</ContactRank></Contact>
+              <Contact><Name>Primary Admin</Name><CILogonID>OSG1000111</CILogonID><ContactRank>Secondary</ContactRank></Contact>
             </Contacts>
           </ContactList>
         </ContactLists>
@@ -58,9 +58,9 @@
           <ContactList>
             <ContactType>Administrative Contact</ContactType>
             <Contacts>
-              <Contact><Name>Someone Else</Name><CILogonID>http://cilogon.org/serverA/users/222</CILogonID><ContactRank>Primary</ContactRank></Contact>
+              <Contact><Name>Someone Else</Name><CILogonID>OSG1000222</CILogonID><ContactRank>Primary</ContactRank></Contact>
               <Contact><Name>No CILogon</Name><ContactRank>Secondary</ContactRank></Contact>
-              <Contact><Name>Primary Admin</Name><CILogonID>http://cilogon.org/serverA/users/111</CILogonID><ContactRank>Tertiary</ContactRank></Contact>
+              <Contact><Name>Primary Admin</Name><CILogonID>OSG1000111</CILogonID><ContactRank>Tertiary</ContactRank></Contact>
             </Contacts>
           </ContactList>
         </ContactLists>
@@ -77,7 +77,7 @@
           <ContactList>
             <ContactType>Administrative Contact</ContactType>
             <Contacts>
-              <Contact><Name>Primary Admin</Name><CILogonID>http://cilogon.org/serverA/users/111</CILogonID><ContactRank>Primary</ContactRank></Contact>
+              <Contact><Name>Primary Admin</Name><CILogonID>OSG1000111</CILogonID><ContactRank>Primary</ContactRank></Contact>
             </Contacts>
           </ContactList>
         </ContactLists>
@@ -94,7 +94,7 @@
           <ContactList>
             <ContactType>Administrative Contact</ContactType>
             <Contacts>
-              <Contact><Name>Primary Admin</Name><CILogonID>http://cilogon.org/serverA/users/111</CILogonID><ContactRank>Primary</ContactRank></Contact>
+              <Contact><Name>Primary Admin</Name><CILogonID>OSG1000111</CILogonID><ContactRank>Primary</ContactRank></Contact>
             </Contacts>
           </ContactList>
         </ContactLists>
@@ -110,7 +110,7 @@
           <ContactList>
             <ContactType>Administrative Contact</ContactType>
             <Contacts>
-              <Contact><Name>Primary Admin</Name><CILogonID>http://cilogon.org/serverA/users/111</CILogonID><ContactRank>Primary</ContactRank></Contact>
+              <Contact><Name>Primary Admin</Name><CILogonID>OSG1000111</CILogonID><ContactRank>Primary</ContactRank></Contact>
             </Contacts>
           </ContactList>
         </ContactLists>
@@ -127,7 +127,7 @@
           <ContactList>
             <ContactType>Security Contact</ContactType>
             <Contacts>
-              <Contact><Name>Primary Admin</Name><CILogonID>http://cilogon.org/serverA/users/111</CILogonID><ContactRank>Primary</ContactRank></Contact>
+              <Contact><Name>Primary Admin</Name><CILogonID>OSG1000111</CILogonID><ContactRank>Primary</ContactRank></Contact>
             </Contacts>
           </ContactList>
         </ContactLists>
@@ -147,7 +147,7 @@
             <Contacts>
               <Contact><Name>Empty ID</Name><CILogonID></CILogonID><ContactRank>Primary</ContactRank></Contact>
               <Contact><Name>Blank ID</Name><CILogonID>   </CILogonID><ContactRank>Secondary</ContactRank></Contact>
-              <Contact><Name>Fifth Admin</Name><CILogonID>http://cilogon.org/serverA/users/555</CILogonID><ContactRank>Tertiary</ContactRank></Contact>
+              <Contact><Name>Fifth Admin</Name><CILogonID>OSG1000555</CILogonID><ContactRank>Tertiary</ContactRank></Contact>
             </Contacts>
           </ContactList>
         </ContactLists>
@@ -169,7 +169,7 @@
           <ContactList>
             <ContactType>Administrative Contact</ContactType>
             <Contacts>
-              <Contact><Name>Other Admin</Name><CILogonID>http://cilogon.org/serverE/users/777</CILogonID><ContactRank>Primary</ContactRank></Contact>
+              <Contact><Name>Other Admin</Name><CILogonID>OSG1000777</CILogonID><ContactRank>Primary</ContactRank></Contact>
             </Contacts>
           </ContactList>
         </ContactLists>

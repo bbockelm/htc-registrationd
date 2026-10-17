@@ -23,14 +23,7 @@ type pages struct {
 }
 
 func loadPages() (*pages, error) {
-	funcs := template.FuncMap{
-		"utc": func(t time.Time) string {
-			if t.IsZero() {
-				return "—"
-			}
-			return t.UTC().Format("2006-01-02 15:04 UTC")
-		},
-	}
+	funcs := template.FuncMap{"utc": utc}
 	p := &pages{t: map[string]*template.Template{}}
 	for _, name := range pageNames {
 		t, err := template.New("layout.html").Funcs(funcs).ParseFS(templateFS, "templates/layout.html", "templates/"+name+".html")
@@ -58,9 +51,16 @@ type messagePage struct {
 	base
 	Heading  string
 	Text     string
-	Detail   string
 	LinkHref string
 	LinkText string
+}
+
+// utc formats t for pages and messages.
+func utc(t time.Time) string {
+	if t.IsZero() {
+		return "an unknown time"
+	}
+	return t.UTC().Format("2006-01-02 15:04 UTC")
 }
 
 func (s *Server) render(w http.ResponseWriter, status int, name string, data any) {

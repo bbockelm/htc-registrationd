@@ -21,11 +21,19 @@ const (
 	// DefaultTopologyMaxBytes caps the rgsummary document. The full OSG
 	// document is a few MB.
 	DefaultTopologyMaxBytes = 64 << 20
-	// topologyQuery asks Topology for active resources, production and
-	// ITB, that run a CE service (ID 1). The response is filtered the same
-	// way locally in case a server ignores the parameters.
-	topologyQuery = "/rgsummary/xml?gridtype=on&gridtype_1=on&service=on&service_1=on&active=on&active_value=1"
 )
+
+// topologyQuery asks Topology for active resources that run a CE service
+// (ID 1), in production (grid type 1) and, with includeITB, in the ITB
+// (grid type 2). The response is filtered for active CEs locally too, in
+// case a server ignores the parameters.
+func topologyQuery(includeITB bool) string {
+	q := "/rgsummary/xml?gridtype=on&gridtype_1=on"
+	if includeITB {
+		q += "&gridtype_2=on"
+	}
+	return q + "&service=on&service_1=on&active=on&active_value=1"
+}
 
 // Topology authorizes from OSG Topology. A principal (the OIDC osgid claim,
 // a CILogon user id) may approve a name when the name is the FQDN of an
@@ -35,7 +43,10 @@ const (
 //
 // The document is fetched every Refresh. When a fetch fails, the last good
 // copy is used until it is older than MaxStale; after that every decision
-// fails until a fetch succeeds.
+// fails until a fetch succeeds. A document with no active CE, or with
+// fewer than half the active CEs of the copy in use, counts as a failed
+// fetch: a truncated or emptied document must not revoke everyone's
+// authorization at once.
 type Topology struct {
 	TopologyConfig
 
@@ -52,6 +63,8 @@ type TopologyConfig struct {
 	Refresh  time.Duration
 	MaxStale time.Duration
 	MaxBytes int64
+	// IncludeITB adds ITB (test) resources to the production ones.
+	IncludeITB bool
 	// Client fetches the document; the default has a 60 s timeout and the
 	// system's trusted roots.
 	Client *http.Client
@@ -142,7 +155,7 @@ func (t *Topology) Fetch(ctx context.Context) error {
 }
 
 func (t *Topology) fetch(ctx context.Context) error {
-	u := strings.TrimSuffix(t.URL, "/") + topologyQuery
+	u := strings.TrimSuffix(t.URL, "/") + topologyQuery(t.IncludeITB)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return err
@@ -168,8 +181,15 @@ func (t *Topology) fetch(ctx context.Context) error {
 		return err
 	}
 	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(data) == 0 {
+		return fmt.Errorf("%s lists no active CE; keeping the copy in use", u)
+	}
+	if prev := len(t.data); len(data)*2 < prev {
+		return fmt.Errorf("%s lists %d active CEs, fewer than half of the %d in the copy in use; keeping that copy "+
+			"(a restart accepts the new document)", u, len(data), prev)
+	}
 	t.data, t.fetched = data, t.Now()
-	t.mu.Unlock()
 	t.Logger.Info("authz: OSG Topology loaded", "ces", len(data))
 	return nil
 }
