@@ -272,20 +272,19 @@ func setupRegistrar(ctx context.Context, d *daemon.Daemon, cfg *config.Config, s
 		return nil, fmt.Errorf("HTC_REGISTRATIOND_CALLBACK_ALLOW_NETWORKS: %w", err)
 	}
 
+	web, err := newRegistrarWeb(d, cfg)
+	if err != nil {
+		_ = store.Close()
+		return nil, err
+	}
 	var names registrar.NamePolicy
 	switch v := strings.ToLower(knobs.String(cfg, "HTC_REGISTRATIOND_CALLBACK_NAMES", "authz")); v {
 	case "any":
 		names = registrar.AnyName{}
 	case "authz":
-		names = registrar.AuthzNames{}
-		log.Warn("HTC_REGISTRATIOND_CALLBACK_NAMES = authz, but this build has no authorization backend " +
-			"(mapfile/topology); callback registrations will be refused. Set it to any to accept every name " +
-			"proven by a trusted certificate.")
+		names = web.namePolicy()
 	default:
 		return nil, fmt.Errorf("HTC_REGISTRATIOND_CALLBACK_NAMES must be authz or any, not %q", v)
-	}
-	if v := knobs.String(cfg, "HTC_REGISTRATIOND_AUTHZ", ""); v != "" {
-		log.Warn("HTC_REGISTRATIOND_AUTHZ is set but this build implements no authorization backend yet", "value", v)
 	}
 
 	recheck, err := knobs.Bool(cfg, "HTC_REGISTRATIOND_RECHECK_APPROVER", true)
@@ -318,7 +317,7 @@ func setupRegistrar(ctx context.Context, d *daemon.Daemon, cfg *config.Config, s
 	if err != nil {
 		return nil, err
 	}
-	verify := knobs.String(cfg, "HTC_REGISTRATIOND_VERIFICATION_URI", "")
+	verify := knobs.String(cfg, "HTC_REGISTRATIOND_VERIFICATION_URI", web.verificationURI())
 	if verify == "" {
 		if host := knobs.String(cfg, "FULL_HOSTNAME", ""); host != "" {
 			verify = "https://" + host + "/approve"
@@ -329,7 +328,7 @@ func setupRegistrar(ctx context.Context, d *daemon.Daemon, cfg *config.Config, s
 		Minter:                 m,
 		SSRF:                   ssrf.New(allow),
 		Names:                  names,
-		Approvers:              registrar.TrustCEDARApprovers{},
+		Approvers:              web.approvers(),
 		RecheckApprover:        recheck,
 		MaxRegistrationAge:     maxAge,
 		CallbackSecurity:       clientSecurity(cfg, protocol.RegCallback),
@@ -348,11 +347,16 @@ func setupRegistrar(ctx context.Context, d *daemon.Daemon, cfg *config.Config, s
 		return nil, err
 	}
 	svc.Register(srv)
+	stopWeb, err := web.start(ctx, d, store)
+	if err != nil {
+		_ = store.Close()
+		return nil, err
+	}
 	go svc.Maintain(ctx, time.Minute)
 	log.Info("registrar ready", "state_dir", dir, "signing_key", m.KeyID, "issuer", m.Issuer,
 		"subject_domain", m.Domain, "limits", strings.Join(m.Limits, ","), "lifetime", lifetime.String(),
 		"callback_allow", len(allow))
-	return func() { _ = store.Close() }, nil
+	return func() { stopWeb(); _ = store.Close() }, nil
 }
 
 // sslServerAvailable reports whether the CE has an SSL server credential: SSL

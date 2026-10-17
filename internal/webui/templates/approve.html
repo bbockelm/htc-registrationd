@@ -1,0 +1,28 @@
+{{define "content"}}
+<h1>Approve CE registration</h1>
+<p class="lead">Confirm this matches the code shown on your CE</p>
+<p class="code">{{.Req.UserCode}}</p>
+<dl class="facts">
+<dt>CE name</dt><dd><code>{{.Req.Name}}</code></dd>
+<dt>Requested from</dt><dd><code>{{.Req.SourceIP}}</code>{{if .RDNS}} ({{.RDNS}}){{end}}</dd>
+<dt>Requested at</dt><dd>{{utc .Req.CreatedAt}}</dd>
+<dt>Code expires</dt><dd>{{utc .Req.ExpiresAt}}</dd>
+{{- if .Req.CEVersion}}
+<dt>CE version</dt><dd>{{.Req.CEVersion}}</dd>
+{{- end}}
+</dl>
+{{- if .Unavailable}}
+<div class="notice bad"><strong>Your authorization could not be checked.</strong> Try again later.</div>
+{{- else if .Decision.Allowed}}
+<div class="notice good"><strong>You are authorized to approve {{.Req.Name}}.</strong> {{.Decision.Reason}}</div>
+<p>Approving lets this CE obtain a token to advertise as <code>{{.Req.Name}}</code>.</p>
+<form method="post" action="/approve" class="actions">
+<input type="hidden" name="csrf" value="{{.CSRF}}">
+<input type="hidden" name="code" value="{{.Req.UserCode}}">
+<button type="submit" name="decision" value="approve" class="primary">Approve</button>
+<button type="submit" name="decision" value="deny" class="secondary">Deny</button>
+</form>
+{{- else}}
+<div class="notice bad"><strong>You are not authorized to approve {{.Req.Name}}.</strong> {{.Decision.Reason}}</div>
+{{- end}}
+{{end}}

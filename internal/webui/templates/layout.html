@@ -1,0 +1,29 @@
+{{define "layout"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>{{.Title}} · CE Registration</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+<a class="brand" href="/approve">CE Registration</a>
+{{- if .User}}
+<nav>
+<a href="/approve">Enter a code</a>
+<a href="/registrations">Registrations</a>
+<form method="post" action="/logout" class="inline"><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit" class="link">Sign out</button></form>
+</nav>
+{{- end}}
+</header>
+<main>
+{{template "content" .}}
+</main>
+{{- if .User}}
+<footer>Signed in as {{if .User.DisplayName}}{{.User.DisplayName}} · {{end}}<code>{{.User.Principal}}</code>{{if .IsAdmin}} · registrar administrator{{end}}</footer>
+{{- end}}
+</body>
+</html>
+{{end}}

@@ -1,0 +1,33 @@
+{{define "content"}}
+<h1>Registrations</h1>
+{{- with .Revoked}}
+<p class="notice good">Revoked the registration of <code>{{.Name}}</code>. The token it holds remains valid until {{utc .TokenExpiry}}.</p>
+{{- end}}
+{{- if .IsAdmin}}
+<p class="muted">All registrations on this registrar.</p>
+{{- else}}
+<p class="muted">Registrations you approved or are authorized to approve.</p>
+{{- end}}
+{{- if .Rows}}
+<div class="scroll">
+<table>
+<thead><tr><th>CE name</th><th>Method</th><th>Status</th><th>Approved by</th><th>Created</th><th>Token expires</th><th></th></tr></thead>
+<tbody>
+{{- range .Rows}}
+<tr>
+<td><code>{{.Reg.Name}}</code></td>
+<td>{{.Reg.Method}}</td>
+<td><span class="status status-{{.Reg.Status}}">{{.Reg.Status}}</span></td>
+<td class="wrap">{{.Approver}}</td>
+<td>{{utc .Reg.CreatedAt}}</td>
+<td>{{utc .Reg.TokenExpiry}}</td>
+<td>{{if .CanRevoke}}<form method="post" action="/registrations/revoke" class="inline"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.Reg.ID}}"><button type="submit" class="danger">Revoke</button></form>{{end}}</td>
+</tr>
+{{- end}}
+</tbody>
+</table>
+</div>
+{{- else}}
+<p>No registrations.</p>
+{{- end}}
+{{end}}
