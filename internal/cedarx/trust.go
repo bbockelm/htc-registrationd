@@ -29,13 +29,28 @@ func SSLTrust(cfg knobs.Getter, side string, sc *security.SecurityConfig) {
 	sc.UseDefaultCAs = &useDefault
 }
 
-// ServerSSLTrust applies SSLTrust's SERVER knobs, read from the current
-// configuration (cfg) at every handshake, to every per-command config srv
-// derives, the base one included, so a reconfig takes effect for the next
-// connection. Call it after the per-command policy is installed (and after
-// HardenCommands).
+// SSLServerCredential sets sc's certificate and key from
+// AUTH_SSL_SERVER_CERTFILE and AUTH_SSL_SERVER_KEYFILE (comma-separated
+// candidates, as HTCondor reads them).
+//
+// Like SSLTrust it ignores sc's method list. golang-htcondor's
+// GetServerSecurityConfig loads the server credential only when SSL is among
+// the configured methods, and HTCondor-CE's default method list is FS alone,
+// so on a stock CE or CE-Collector a hardened (SSL-only) command would
+// otherwise be served with no certificate.
+func SSLServerCredential(cfg knobs.Getter, sc *security.SecurityConfig) {
+	sc.CertFile = knobs.String(cfg, "AUTH_SSL_SERVER_CERTFILE", "")
+	sc.KeyFile = knobs.String(cfg, "AUTH_SSL_SERVER_KEYFILE", "")
+}
+
+// ServerSSLTrust applies SSLTrust's SERVER knobs and SSLServerCredential,
+// read from the current configuration (cfg) at every handshake, to every
+// per-command config srv derives, the base one included, so a reconfig
+// takes effect for the next connection. Call it after the per-command
+// policy is installed (and after HardenCommands).
 func ServerSSLTrust(cfg func() knobs.Getter, srv *cedarserver.Server) {
 	SSLTrust(cfg(), "SERVER", srv.SecurityConfig)
+	SSLServerCredential(cfg(), srv.SecurityConfig)
 	prev := srv.SecurityConfigForCommand
 	srv.SecurityConfigForCommand = func(cmd int) *security.SecurityConfig {
 		var sc *security.SecurityConfig
@@ -46,7 +61,9 @@ func ServerSSLTrust(cfg func() knobs.Getter, srv *cedarserver.Server) {
 			sc = srv.SecurityConfig
 		}
 		c := *sc
-		SSLTrust(cfg(), "SERVER", &c)
+		cur := cfg()
+		SSLTrust(cur, "SERVER", &c)
+		SSLServerCredential(cur, &c)
 		return &c
 	}
 }

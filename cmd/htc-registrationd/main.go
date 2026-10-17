@@ -432,21 +432,12 @@ func setupRegistrar(ctx context.Context, d *daemon.Daemon, cfg *config.Config, c
 	return func() { stopWeb(); _ = store.Close() }, nil
 }
 
-// sslServerAvailable reports whether the CE has an SSL server credential: SSL
-// is among the server's authentication methods and one of the configured
-// certificate/key candidate pairs loads. The pairs are read through the same
-// credential reader cedar uses; which pair cedar would serve is cedar's
-// decision, not this daemon's.
+// sslServerAvailable reports whether the CE has an SSL server credential:
+// one of the configured certificate/key candidate pairs loads. REG_CALLBACK
+// is served with SSL whatever the pool's method list says, so the list is
+// not consulted. The pairs are read through the same credential reader cedar
+// uses; which pair cedar would serve is cedar's decision, not this daemon's.
 func sslServerAvailable(sc *security.SecurityConfig) (bool, string) {
-	ssl := false
-	for _, m := range sc.AuthMethods {
-		if m == security.AuthSSL {
-			ssl = true
-		}
-	}
-	if !ssl {
-		return false, "SSL is not an enabled authentication method"
-	}
 	if sc.CertFile == "" || sc.KeyFile == "" {
 		return false, "no AUTH_SSL_SERVER_CERTFILE / AUTH_SSL_SERVER_KEYFILE configured"
 	}
@@ -560,11 +551,15 @@ func setupCE(ctx context.Context, d *daemon.Daemon, cfg *config.Config, cur func
 			}
 			return "", fmt.Errorf("no advertised address (not behind shared port); set HTC_REGISTRATIOND_CALLBACK_ADDRESS")
 		},
-		SSLServerAvailable: func() (bool, string) { return sslServerAvailable(serverSC) },
-		ClientSecurity:     clientSecurity(cur, protocol.RegRequest),
-		Reconfig:           func(ctx context.Context) error { return reconfigMaster(ctx, d, cur()) },
-		Ping:               pingViewHost(cur),
-		Logger:             log,
+		SSLServerAvailable: func() (bool, string) {
+			sc := *serverSC
+			cedarx.SSLServerCredential(cur(), &sc)
+			return sslServerAvailable(&sc)
+		},
+		ClientSecurity: clientSecurity(cur, protocol.RegRequest),
+		Reconfig:       func(ctx context.Context) error { return reconfigMaster(ctx, d, cur()) },
+		Ping:           pingViewHost(cur),
+		Logger:         log,
 	})
 	if err != nil {
 		return err
