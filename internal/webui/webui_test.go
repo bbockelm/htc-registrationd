@@ -269,7 +269,8 @@ func TestLoginThenApprove(t *testing.T) {
 
 	body, code = h.post(c, "/approve", url.Values{"csrf": {csrfFrom(t, body)}, "code": {"BCDF-GHJK"}, "decision": {"approve"}},
 		map[string]string{"Origin": h.web.URL})
-	if code != http.StatusOK || !strings.Contains(body, "was approved by you") {
+	if code != http.StatusOK || !strings.Contains(body, "was approved by you") ||
+		!strings.Contains(body, "The CE has not collected its token yet.") {
 		t.Fatalf("after approving: %d\n%s", code, body)
 	}
 	r := h.status("BCDF-GHJK")
@@ -741,7 +742,7 @@ func TestSecurityHeaders(t *testing.T) {
 			!strings.Contains(csp, "frame-ancestors 'none'") || strings.Contains(csp, "script-src") {
 			t.Errorf("%s: CSP %q", path, csp)
 		}
-		if hd.Get("X-Frame-Options") != "DENY" || hd.Get("Referrer-Policy") != "no-referrer" || hd.Get("X-Content-Type-Options") != "nosniff" {
+		if hd.Get("X-Frame-Options") != "DENY" || hd.Get("Referrer-Policy") != "same-origin" || hd.Get("X-Content-Type-Options") != "nosniff" {
 			t.Errorf("%s: headers %v", path, hd)
 		}
 		if hd.Get("Strict-Transport-Security") != "" {
@@ -773,7 +774,9 @@ func TestSecureCookies(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/login?next=/registrations", nil))
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/login?next=/registrations", nil)
+	req.Host = "registrar.example.org"
+	srv.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusFound {
 		t.Fatalf("login: %d", rec.Code)
 	}
@@ -1192,5 +1195,80 @@ func TestCodeFormAfterSessionEnds(t *testing.T) {
 	// Following a link (the CE's verification URI) still redirects.
 	if _, code := h.get(c, "/approve?code=BCDF-GHJK"); code != http.StatusSeeOther {
 		t.Errorf("signed-out link: %d", code)
+	}
+}
+
+// TestSignInCancelled: a provider's access_denied ends the login with a
+// page that offers to start again and return to the same page.
+func TestSignInCancelled(t *testing.T) {
+	h := newHarness(t)
+	for _, tc := range []struct {
+		error, heading string
+		status         int
+	}{
+		{"access_denied", "Sign-in cancelled", http.StatusOK},
+		{"server_error", "Sign-in failed", http.StatusUnauthorized},
+	} {
+		c := h.browser()
+		c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, h.web.URL+"/login?next=%2Fapprove%3Fcode%3DBCDF-GHJK", nil)
+		resp, err := c.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		auth, _ := url.Parse(resp.Header.Get("Location"))
+		back := h.web.URL + "/oidc/callback?" + url.Values{"error": {tc.error}, "state": {auth.Query().Get("state")}}.Encode()
+		body, status := h.get(c, strings.TrimPrefix(back, h.web.URL))
+		if status != tc.status || !strings.Contains(body, "<h1>"+tc.heading+"</h1>") {
+			t.Errorf("%s: HTTP %d\n%s", tc.error, status, body)
+		}
+		if !strings.Contains(body, `<a href="/login?next=%2Fapprove%3Fcode%3DBCDF-GHJK">Sign in</a>`) {
+			t.Errorf("%s: no link to sign in again:\n%s", tc.error, body)
+		}
+		if n := h.srv.logins.len(); n != 0 {
+			t.Errorf("%s: %d logins still pending", tc.error, n)
+		}
+		if h.idp.tokenRequests != 0 {
+			t.Errorf("%s: %d token requests", tc.error, h.idp.tokenRequests)
+		}
+	}
+}
+
+// TestApprovedRequestOnceIssued: an approved request whose token was issued
+// says so, before the CE's first renewal claims it.
+func TestApprovedRequestOnceIssued(t *testing.T) {
+	h := newHarness(t)
+	h.registerFull(testCE, "MNPQ-RSTV", registrar.Identity{Kind: authz.IdentityKind, Principal: h.idp.URL() + ",alice"})
+	c := h.browser()
+	h.login(c, "alice")
+	body, code := h.get(c, "/approve?code=MNPQ-RSTV")
+	if code != http.StatusOK || !strings.Contains(body, "The registrar has issued the CE its token.") {
+		t.Fatalf("issued request: %d\n%s", code, body)
+	}
+}
+
+// TestLoginMovesToThePublicHost: a login started under another name for
+// the server restarts on the public URL's host, where the provider returns
+// the browser and the state cookie must be; once, whatever the Host.
+func TestLoginMovesToThePublicHost(t *testing.T) {
+	h := newHarness(t)
+	pub, _ := url.Parse(h.web.URL)
+	other := "localhost:" + pub.Port()
+	for _, tc := range []struct {
+		host, query, want string
+	}{
+		{other, "next=%2Fapprove%3Fcode%3DBCDF-GHJK", h.web.URL + "/login?next=%2Fapprove%3Fcode%3DBCDF-GHJK&public=1"},
+		{other, "next=%2Fapprove&public=1", h.idp.URL() + "/authorize?"},
+		{pub.Host, "next=%2Fapprove", h.idp.URL() + "/authorize?"},
+		{strings.ToUpper(pub.Host), "", h.idp.URL() + "/authorize?"},
+	} {
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/login?"+tc.query, nil)
+		req.Host = tc.host
+		rec := httptest.NewRecorder()
+		h.srv.Handler().ServeHTTP(rec, req)
+		if loc := rec.Header().Get("Location"); !strings.HasPrefix(loc, tc.want) {
+			t.Errorf("Host %s, %s: HTTP %d to %q, want %q", tc.host, tc.query, rec.Code, loc, tc.want)
+		}
 	}
 }

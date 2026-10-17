@@ -1,0 +1,15 @@
+{
+  "name": "htc-registrationd-e2e",
+  "private": true,
+  "description": "Browser tests of the htc-registrationd laptop demo",
+  "license": "Apache-2.0",
+  "scripts": {
+    "test": "playwright test",
+    "typecheck": "tsc"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1",
+    "@types/node": "^26.6.5",
+    "typescript": "7.0.2"
+  }
+}

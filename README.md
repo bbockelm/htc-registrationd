@@ -86,7 +86,7 @@ make demo-status                       # both CEs' state and the registrar's lis
 make demo-revoke NAME=ce1.localhost    # revoke a registration
 make demo-renew CE=ce1                 # renew a CE's token now
 make demo-request CE=ce1               # start an approval request on a CE
-make demo-approve CODE=XXXX-XXXX       # approve on the command line
+make demo-approve CODE=XXXX-XXXX NAME=ce2.localhost  # approve on the command line
 make demo-advertise CE=ce1 NAME=ce2.localhost  # advertise with a CE's token
 make demo-clean                        # remove all demo state
 CONDOR_BIN=/path/to/release_dir/sbin make demo   # use this HTCondor
@@ -94,7 +94,8 @@ CONDOR_BIN=/path/to/release_dir/sbin make demo   # use this HTCondor
 
 All state is in `.demo/`: a throw-away CA and certificates, each daemon's
 `condor_config`, logs and spool, the signing key, and the installed tokens.
-It survives a restart; `make demo-clean` removes it. The `*.localhost` names
+It survives a restart; `make demo-clean` removes it. While the demo runs,
+`.demo/ready.json` lists its URLs, files and ce2's approval code. The `*.localhost` names
 resolve to loopback without configuration (RFC 6761), and certificates are
 still verified against them. Ports are chosen once, between 20000 and 30000,
 and kept in `.demo/ports.json`.
@@ -107,6 +108,20 @@ advertises that CE's Scheduler ad with the new token.
 the web UI and the identity provider as a browser would, and checks that
 both CEs install tokens the registrar's key verifies, and, with HTCondor
 installed, what the collector accepts.
+
+`make e2e` does the same in real browsers, by clicking through the pages
+([Playwright](https://playwright.dev), under `e2e/`; needs Node.js 20 or
+newer): mallory refused, alice approving ce2 and ce2 installing its token, a
+typed subject, Cancel at the identity provider, the code form, a session
+that ends while the code form is open, and admin revoking ce1. Each browser
+gets a demo of its own, with no HTCondor collector unless `CONDOR_BIN` is
+set.
+
+```
+make e2e                                   # Chromium
+make e2e E2E_BROWSERS="chromium webkit firefox"
+cd e2e && E2E_DEMO_DIR=.demo npx playwright test   # drive a fresh make demo
+```
 
 ## Running under the master
 
@@ -257,7 +272,8 @@ used as identity.
   `127.0.0.1, ::1`.
 - `PUBLIC_URL`: required; the `https://` origin browsers and CEs use, with no
   path (`http://` only for a loopback host). It is used in lower case and
-  without a default port (`:443`).
+  without a default port (`:443`). A sign-in that reaches the UI under
+  another host name is sent to this one first.
 - `OIDC_ISSUER`: the provider's issuer URL, read via
   `/.well-known/openid-configuration`. Register `<PUBLIC_URL>/oidc/callback`,
   in that form, as the client's redirect URI.

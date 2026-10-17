@@ -131,6 +131,24 @@ func TestAuthorizeChecksRequest(t *testing.T) {
 	}
 }
 
+// TestLoginPageFormAction: browsers apply form-action to the redirect that
+// answers the login form, so it must allow the client's origin.
+func TestLoginPageFormAction(t *testing.T) {
+	srv := newProvider(t)
+	q := url.Values{"client_id": {"client"}, "redirect_uri": {redirect}, "response_type": {"code"},
+		"code_challenge": {"x"}, "code_challenge_method": {"S256"}}
+	resp := do(t, http.MethodGet, srv.URL+"/authorize?"+q.Encode(), nil, nil)
+	csp := resp.header.Get("Content-Security-Policy")
+	if !strings.Contains(csp, "form-action 'self' http://localhost:9999") || strings.Contains(csp, "/oidc") {
+		t.Errorf("login page CSP %q", csp)
+	}
+	for _, attr := range []string{`required`, `pattern="[A-Za-z0-9._@\-]{1,64}"`, `formnovalidate`} {
+		if !strings.Contains(string(resp.body), attr) {
+			t.Errorf("login page lacks %s", attr)
+		}
+	}
+}
+
 func TestTokenAndUserinfo(t *testing.T) {
 	srv := newProvider(t)
 	const verifier = "the-verifier-0123456789-0123456789-0123456789"

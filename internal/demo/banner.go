@@ -84,7 +84,7 @@ func (d *Demo) Banner() string {
 	p("   make demo-revoke NAME=ce1.localhost  revoke ce1's registration")
 	p("   make demo-renew CE=ce1               renew ce1's token now")
 	p("   make demo-request CE=ce1             start an approval request on ce1 (prints its URL and code)")
-	p("   make demo-approve CODE=XXXX-XXXX     approve a request on the command line")
+	p("   make demo-approve CODE=XXXX-XXXX NAME=ce2.localhost   approve a request on the command line")
 	if d.collector != nil {
 		p("   make demo-advertise CE=ce1 NAME=ce2.localhost   advertise a Scheduler ad with ce1's token")
 	}

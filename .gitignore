@@ -26,3 +26,8 @@ coverage.*
 
 # `make demo` state
 /.demo/
+
+# `make e2e`
+/e2e/node_modules/
+/e2e/test-results/
+playwright-report/

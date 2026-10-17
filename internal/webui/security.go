@@ -29,8 +29,10 @@ func withHeaders(next http.Handler) http.Handler {
 		h := w.Header()
 		h.Set("Content-Security-Policy", contentSecurityPolicy)
 		h.Set("X-Frame-Options", "DENY")
-		// The user code travels in the URL.
-		h.Set("Referrer-Policy", "no-referrer")
+		// The user code travels in the URL, so no other origin is sent a
+		// Referer. Not no-referrer: under it a browser sends "Origin: null"
+		// with every form POST, which sameOrigin refuses.
+		h.Set("Referrer-Policy", "same-origin")
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Cross-Origin-Opener-Policy", "same-origin")
 		h.Set("Cross-Origin-Resource-Policy", "same-origin")
