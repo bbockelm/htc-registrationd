@@ -220,13 +220,18 @@ error is logged.
 FQDN of an active resource with a CE service and the user's principal (the
 `osgid` claim: set `OIDC_PRINCIPAL_CLAIM = osgid`) is the `CILogonID` of a
 contact in any of its Administrative Contact lists (Primary, Secondary or
-Tertiary). A name is known when it is an active CE's FQDN.
+Tertiary). A name is known when it is an active CE's FQDN. A contact
+listed without a `CILogonID` can never approve.
 
 - `TOPOLOGY_URL`: default `https://topology.opensciencegrid.org` (https only).
+- `TOPOLOGY_INCLUDE_ITB`: default false: production resources only. When
+  true, ITB resources are included too.
 - `TOPOLOGY_REFRESH`: default 15 min.
 - `TOPOLOGY_MAX_STALE`: default 24 h. When fetches fail, the last good copy
   is used until it is this old; after that every decision fails until a fetch
-  succeeds.
+  succeeds. A document listing no active CE, or fewer than half the active
+  CEs of the copy in use, counts as a failed fetch and is logged as an
+  error; a restart accepts it.
 
 ### Command line
 

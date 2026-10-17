@@ -2,6 +2,7 @@ package authz
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,14 +11,16 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/bbockelm/htc-registrationd/internal/knobs"
 )
 
 const (
-	admin111 = "http://cilogon.org/serverA/users/111"
-	admin222 = "http://cilogon.org/serverA/users/222"
-	sec333   = "http://cilogon.org/serverA/users/333"
-	admin555 = "http://cilogon.org/serverA/users/555"
-	admin777 = "http://cilogon.org/serverE/users/777"
+	admin111 = "OSG1000111"
+	admin222 = "OSG1000222"
+	sec333   = "OSG1000333"
+	admin555 = "OSG1000555"
+	admin777 = "OSG1000777"
 )
 
 type clock struct {
@@ -38,30 +41,31 @@ func (c *clock) Advance(d time.Duration) {
 }
 
 // topologyServer serves the fixture over TLS, or fails while fail is set.
-func topologyServer(t *testing.T) (*httptest.Server, *atomic.Bool, *atomic.Value) {
+// Storing a []byte in doc replaces the document it serves.
+func topologyServer(t *testing.T) (srv *httptest.Server, fail *atomic.Bool, query, doc *atomic.Value) {
 	t.Helper()
-	doc, err := os.ReadFile("testdata/rgsummary.xml")
+	fixture, err := os.ReadFile("testdata/rgsummary.xml")
 	if err != nil {
 		t.Fatal(err)
 	}
-	var fail atomic.Bool
-	var query atomic.Value
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	fail, query, doc = &atomic.Bool{}, &atomic.Value{}, &atomic.Value{}
+	doc.Store(fixture)
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		query.Store(r.URL.RequestURI())
 		if fail.Load() {
 			http.Error(w, "down", http.StatusServiceUnavailable)
 			return
 		}
 		w.Header().Set("Content-Type", "text/xml")
-		_, _ = w.Write(doc)
+		_, _ = w.Write(doc.Load().([]byte))
 	}))
 	t.Cleanup(srv.Close)
-	return srv, &fail, &query
+	return srv, fail, query, doc
 }
 
 func newTestTopology(t *testing.T) (*Topology, *clock, *atomic.Bool) {
 	t.Helper()
-	srv, fail, query := topologyServer(t)
+	srv, fail, query, _ := topologyServer(t)
 	c := &clock{t: time.Unix(1_800_000_000, 0)}
 	topo := NewTopology(TopologyConfig{URL: srv.URL + "/", Client: srv.Client(), Now: c.Now, MaxStale: 24 * time.Hour})
 	if err := topo.Fetch(context.Background()); err != nil {
@@ -97,7 +101,7 @@ func TestTopologyDecide(t *testing.T) {
 		{"empty principal never matches an empty CILogonID", "", "ce5.example.edu", false, "Not an Administrative Contact for resource EXAMPLE-CE5 in OSG Topology"},
 		{"blank principal never matches a blank CILogonID", "   ", "ce5.example.edu", false, "Not an Administrative Contact for resource EXAMPLE-CE5 in OSG Topology"},
 		{"CE by service name", admin777, "ce.other.org", true, "Administrative Contact (Primary) for resource OTHER-CE in OSG Topology"},
-		{"principal is compared exactly", strings.ToUpper(admin111), "ce1.example.edu", false, "Not an Administrative Contact for resource EXAMPLE-CE1 in OSG Topology"},
+		{"principal is compared exactly", strings.ToLower(admin111), "ce1.example.edu", false, "Not an Administrative Contact for resource EXAMPLE-CE1 in OSG Topology"},
 		{"unknown name", admin111, "nowhere.example.edu", false, "nowhere.example.edu is not the FQDN of an active CE in OSG Topology"},
 	}
 	for _, tc := range cases {
@@ -165,7 +169,7 @@ func TestTopologyStaleRefusal(t *testing.T) {
 }
 
 func TestTopologyNoDataYet(t *testing.T) {
-	srv, fail, _ := topologyServer(t)
+	srv, fail, _, _ := topologyServer(t)
 	fail.Store(true)
 	topo := NewTopology(TopologyConfig{URL: srv.URL, Client: srv.Client()})
 	if _, err := topo.Decide(context.Background(), admin111, "ce1.example.edu"); err == nil {
@@ -179,7 +183,7 @@ func TestTopologyNoDataYet(t *testing.T) {
 }
 
 func TestTopologySizeCap(t *testing.T) {
-	srv, _, _ := topologyServer(t)
+	srv, _, _, _ := topologyServer(t)
 	topo := NewTopology(TopologyConfig{URL: srv.URL, Client: srv.Client(), MaxBytes: 100})
 	if err := topo.Fetch(context.Background()); err == nil || !strings.Contains(err.Error(), "larger than") {
 		t.Fatalf("oversized document: %v", err)
@@ -189,5 +193,97 @@ func TestTopologySizeCap(t *testing.T) {
 func TestTopologyRejectsBadXML(t *testing.T) {
 	if _, err := parseTopology([]byte("<html>not topology</html>")); err == nil {
 		t.Fatal("parsed a non-rgsummary document")
+	}
+}
+
+// ceDoc is an rgsummary listing n active CEs, ce1.example.edu onward, each
+// administered by admin111.
+func ceDoc(n int) []byte {
+	var b strings.Builder
+	b.WriteString("<ResourceSummary><ResourceGroup><Resources>")
+	for i := 1; i <= n; i++ {
+		fmt.Fprintf(&b, `<Resource><Name>CE%d</Name><Active>True</Active><FQDN>ce%d.example.edu</FQDN>`+
+			`<Services><Service><ID>1</ID><Name>CE</Name></Service></Services>`+
+			`<ContactLists><ContactList><ContactType>Administrative Contact</ContactType><Contacts>`+
+			`<Contact><Name>A</Name><CILogonID>%s</CILogonID><ContactRank>Primary</ContactRank></Contact>`+
+			`</Contacts></ContactList></ContactLists></Resource>`, i, i, admin111)
+	}
+	b.WriteString("</Resources></ResourceGroup></ResourceSummary>")
+	return []byte(b.String())
+}
+
+func TestTopologyRefusesEmptiedDocument(t *testing.T) {
+	srv, _, _, doc := topologyServer(t)
+	c := &clock{t: time.Unix(1_800_000_000, 0)}
+	topo := NewTopology(TopologyConfig{URL: srv.URL, Client: srv.Client(), Now: c.Now, MaxStale: 24 * time.Hour})
+	ctx := context.Background()
+	if err := topo.Fetch(ctx); err != nil { // the fixture: 6 active CEs
+		t.Fatal(err)
+	}
+	stillServing := func(desc string) {
+		t.Helper()
+		if d, err := topo.Decide(ctx, admin111, "ce4.example.edu"); err != nil || d.Allowed ||
+			!strings.Contains(d.Reason, "EXAMPLE-CE4") {
+			t.Errorf("%s: the last good copy is not in use: %+v, %v", desc, d, err)
+		}
+	}
+	for desc, bad := range map[string][]byte{
+		"well-formed but empty":    []byte("<ResourceSummary></ResourceSummary>"),
+		"no active CE":             []byte("<ResourceSummary><ResourceGroup><Resources></Resources></ResourceGroup></ResourceSummary>"),
+		"fewer than half the CEs":  ceDoc(2),
+		"a single CE of six known": ceDoc(1),
+	} {
+		doc.Store(bad)
+		c.Advance(time.Hour)
+		if err := topo.Fetch(ctx); err == nil {
+			t.Errorf("%s: accepted", desc)
+		}
+		stillServing(desc)
+	}
+
+	// The kept copy is still subject to MaxStale.
+	c.Advance(24 * time.Hour)
+	if _, err := topo.Decide(ctx, admin111, "ce1.example.edu"); err == nil {
+		t.Error("the kept copy outlived MaxStale")
+	}
+
+	// Half the CEs is accepted.
+	doc.Store(ceDoc(3))
+	if err := topo.Fetch(ctx); err != nil {
+		t.Fatalf("half the CEs: %v", err)
+	}
+	if ok, err := topo.Known(ctx, "ce4.example.edu"); err != nil || ok {
+		t.Errorf("the new document is not in use: %v, %v", ok, err)
+	}
+
+	// With no copy in use, an empty document is still refused.
+	empty := NewTopology(TopologyConfig{URL: srv.URL, Client: srv.Client()})
+	doc.Store([]byte("<ResourceSummary></ResourceSummary>"))
+	if err := empty.Fetch(ctx); err == nil {
+		t.Error("an empty first document was accepted")
+	}
+	if _, err := empty.Decide(ctx, admin111, "ce1.example.edu"); err == nil {
+		t.Error("decided from an empty document")
+	}
+}
+
+func TestTopologyIncludeITB(t *testing.T) {
+	srv, _, query, _ := topologyServer(t)
+	topo := NewTopology(TopologyConfig{URL: srv.URL, Client: srv.Client(), IncludeITB: true})
+	if err := topo.Fetch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	want := "/rgsummary/xml?gridtype=on&gridtype_1=on&gridtype_2=on&service=on&service_1=on&active=on&active_value=1"
+	if got, _ := query.Load().(string); got != want {
+		t.Errorf("fetched %q, want %q", got, want)
+	}
+	for knob, want := range map[string]bool{"": false, "false": false, "true": true} {
+		tc, err := topologyConfig(knobs.Map{"HTC_REGISTRATIOND_TOPOLOGY_INCLUDE_ITB": knob}, nil)
+		if err != nil || tc.IncludeITB != want {
+			t.Errorf("INCLUDE_ITB = %q: %v, %v", knob, tc.IncludeITB, err)
+		}
+	}
+	if _, err := topologyConfig(knobs.Map{"HTC_REGISTRATIOND_TOPOLOGY_INCLUDE_ITB": "maybe"}, nil); err == nil {
+		t.Error("INCLUDE_ITB = maybe accepted")
 	}
 }

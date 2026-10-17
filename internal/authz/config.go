@@ -84,6 +84,9 @@ func topologyConfig(cfg knobs.Getter, log *slog.Logger) (TopologyConfig, error) 
 	if tc.MaxStale, err = knobs.Duration(cfg, "HTC_REGISTRATIOND_TOPOLOGY_MAX_STALE", DefaultTopologyMaxStale); err != nil {
 		return tc, err
 	}
+	if tc.IncludeITB, err = knobs.Bool(cfg, "HTC_REGISTRATIOND_TOPOLOGY_INCLUDE_ITB", false); err != nil {
+		return tc, err
+	}
 	return tc, nil
 }
 
