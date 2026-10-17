@@ -18,3 +18,8 @@ coverage.*
 .idea/
 .vscode/
 *.swp
+
+# Packaging: `make rpm` stages the payload in packaging/staging and writes
+# the RPM to dist/.
+/dist/
+/packaging/staging/

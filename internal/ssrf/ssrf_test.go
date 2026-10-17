@@ -189,41 +189,22 @@ func TestControlInDialer(t *testing.T) {
 	_ = c.Close()
 }
 
-type fakeResolver map[string][]string
-
-func (f fakeResolver) LookupNetIP(_ context.Context, _, host string) ([]netip.Addr, error) {
-	addrs, ok := f[host]
-	if !ok {
-		return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
-	}
-	out := make([]netip.Addr, 0, len(addrs))
-	for _, a := range addrs {
-		out = append(out, netip.MustParseAddr(a))
-	}
-	return out, nil
-}
-
 func TestCheckSinful(t *testing.T) {
 	p := newTestPolicy(t, "")
-	p.Resolver = fakeResolver{
-		"ce.example.edu":       {"192.0.2.10"},
-		"rebind.example.edu":   {"127.0.0.1"},
-		"mixed.example.edu":    {"192.0.2.10", "10.0.0.5"},
-		"metadata.example.edu": {"169.254.169.254"},
-		"v6.example.edu":       {"2001:db8::10"},
-	}
 	cases := []struct {
 		name, sinful, dial, errHas string
 	}{
 		{name: "public IP with shared port",
 			sinful: "<192.0.2.10:9619?addrs=192.0.2.10-9619&sock=htc_registrationd>",
-			dial:   "<192.0.2.10:9619?sock=htc_registrationd>"},
-		{name: "host name is pinned to its checked address",
-			sinful: "<ce.example.edu:9619?sock=htc_registrationd_1234_abcd>",
-			dial:   "<192.0.2.10:9619?sock=htc_registrationd_1234_abcd>"},
-		{name: "ipv6 host",
-			sinful: "<v6.example.edu:9619>",
-			dial:   "<[2001:db8::10]:9619>"},
+			dial:   "<192.0.2.10:9619?addrs=192.0.2.10-9619&sock=htc_registrationd>"},
+		// Host names are left for cedar to resolve; the dial hook checks the
+		// addresses they resolve to.
+		{name: "host name is not resolved",
+			sinful: "<ce.example.edu:9619?sock=htc_registrationd>",
+			dial:   "<ce.example.edu:9619?sock=htc_registrationd>"},
+		{name: "name resolving to loopback is left to the dial hook",
+			sinful: "<localhost:9619>",
+			dial:   "<localhost:9619>"},
 		{name: "ipv6 literal",
 			sinful: "<[2001:db8::11]:9619>",
 			dial:   "<[2001:db8::11]:9619>"},
@@ -231,10 +212,7 @@ func TestCheckSinful(t *testing.T) {
 			sinful: "192.0.2.10:9618",
 			dial:   "<192.0.2.10:9618>"},
 		{name: "loopback literal", sinful: "<127.0.0.1:9619>", errHas: "loopback"},
-		{name: "name resolving to loopback", sinful: "<rebind.example.edu:9619>", errHas: "loopback"},
-		{name: "name resolving to a mix", sinful: "<mixed.example.edu:9619>", errHas: "RFC 1918"},
-		{name: "metadata service", sinful: "<metadata.example.edu:80>", errHas: "link-local"},
-		{name: "unresolvable", sinful: "<nope.example.edu:9619>", errHas: "resolving"},
+		{name: "metadata service literal", sinful: "<169.254.169.254:80>", errHas: "link-local"},
 		{name: "private addrs entry", sinful: "<192.0.2.10:9619?addrs=192.0.2.10-9619+10.0.0.1-9619>", errHas: "RFC 1918"},
 		{name: "ipv6 loopback addrs entry", sinful: "<192.0.2.10:9619?addrs=[::1]-9619>", errHas: "loopback"},
 		{name: "CCB contact", sinful: "<10.0.0.5:9619?CCBID=192.0.2.1:9618#42&sock=x>", errHas: "CCB"},
@@ -247,7 +225,7 @@ func TestCheckSinful(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			tgt, err := p.CheckSinful(context.Background(), tc.sinful)
+			tgt, err := p.CheckSinful(tc.sinful)
 			if tc.errHas != "" {
 				if err == nil {
 					t.Fatalf("accepted (dial %s), want error containing %q", tgt.Dial, tc.errHas)
@@ -272,7 +250,7 @@ func TestCheckSinful(t *testing.T) {
 
 func TestCheckSinfulAllowListedLoopback(t *testing.T) {
 	p := newTestPolicy(t, "127.0.0.0/8", "127.0.0.1")
-	tgt, err := p.CheckSinful(context.Background(), "<127.0.0.1:4242>")
+	tgt, err := p.CheckSinful("<127.0.0.1:4242>")
 	if err != nil {
 		t.Fatal(err)
 	}

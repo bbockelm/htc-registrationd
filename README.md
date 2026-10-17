@@ -38,13 +38,28 @@ make build        # bin/htc-registrationd, bin/htc-registration -> htc-registrat
 make test         # go test ./...
 make test-race
 make vet lint
+make rpm          # dist/htc-registrationd-*.rpm (needs nfpm)
 ```
 
+The RPM installs `/usr/sbin/htc-registrationd`, the `/usr/bin/htc-registration`
+symlink, and two configuration files in `/etc/condor-ce/config.d/`:
+`50-htc-registrationd-ce.conf` for a CE and
+`50-htc-registrationd-registrar.conf` for the CE-Collector. Installing it
+starts nothing: enable the daemon by uncommenting the `DAEMON_LIST` and
+`HTC_REGISTRATIOND_MODE` lines in one of the two.
+
+## Running under the master
+
+The daemon must be a DaemonCore daemon to the master
+(`DC_DAEMON_LIST = $(DC_DAEMON_LIST) +HTC_REGISTRATIOND`), so the master hands
+it a shared-port endpoint. The master names that endpoint after the `-sock`
+argument in `HTC_REGISTRATIOND_ARGS`; without one the name carries the
+master's pid and a random tag and changes on every restart. Both shipped
+configurations set `HTC_REGISTRATIOND_ARGS = -sock htc_registrationd`, so the
+registrar is always at `<collector-host:port?sock=htc_registrationd>`.
+
 The end-to-end tests in `internal/ce` run a registrar and a CE as two cedar
-servers on loopback, using a generated test CA. They need a cedar that can
-complete a Go-to-Go SSL handshake. When the linked cedar cannot, they skip
-with a message that names the failure. Set
-`HTC_REGISTRATIOND_REQUIRE_GO_SSL=1` to make them fail instead.
+servers on loopback, using a generated test CA.
 
 ## Command numbers
 
@@ -77,12 +92,19 @@ CE:
 - `NAME`: default `$(SCHEDD_NAME)`, then `$(FULL_HOSTNAME)`. Must equal the
   Scheduler ad's `Name`.
 - `METHOD`: `auto` | `callback` | `approval` (default `auto`).
-- `REGISTRAR`: the registrar's address (required).
+- `REGISTRAR`: the registrar's address. Default: the host:port of the first
+  `CONDOR_VIEW_HOST` entry (`COLLECTOR_PORT` when it names no port) with
+  `sock=htc_registrationd`, e.g.
+  `<collector.example.org:9619?sock=htc_registrationd>`. That is where a
+  registrar running behind the CE-Collector's shared port listens, so a CE
+  that already advertises to its CE-Collector needs no extra configuration.
 - `REGISTRAR_NAME`: the name its certificate must carry. By default this is
   derived from the address.
-- `REGISTRAR_CAFILE`: default `AUTH_SSL_CLIENT_CAFILE`.
 - `CALLBACK_ADDRESS`: default: the daemon's shared-port sinful.
 - `TOKEN_FILE`: default `$(SEC_TOKEN_SYSTEM_DIRECTORY)/50-htc-registration`.
+  The daemon runs as condor and writes the file itself, so the directory must
+  be writable by condor. On an HTCondor-CE it is `/etc/condor-ce/tokens.d`,
+  which the CE package creates owned by condor, mode 0700.
 
 Registrar:
 
@@ -95,14 +117,20 @@ Registrar:
   until an authorization backend exists).
 - `CALLBACK_ALLOW_NETWORKS`: CIDRs re-allowed for callbacks. Loopback, RFC
   1918, CGNAT, link-local, multicast, ULA, their IPv4-mapped / NAT64 / 6to4
-  forms, and the registrar's own addresses are denied by default.
-- `CALLBACK_CAFILE`: default `AUTH_SSL_CLIENT_CAFILE`.
+  forms, and the registrar's own addresses are denied by default. The check
+  runs at connect time on each address the callback actually dials, after
+  the CE's host name is resolved.
 - `CALLBACK_CONNECT_TIMEOUT` / `CALLBACK_TIMEOUT`: default 10 s / 30 s.
 - `MAX_PENDING_PER_IP` / `MAX_PENDING`: default 10 / 1000.
 - `APPROVAL_TTL` (30 min), `UNCLAIMED_TTL` (24 h), `POLL_INTERVAL` (5 s).
 - `VERIFICATION_URI`: default `https://$(FULL_HOSTNAME)/approve`.
 - `RECHECK_APPROVER` (true), `MAX_REGISTRATION_AGE` (no cap).
 
-Not built yet: the HTTPS approval UI with OIDC login, the mapfile and OSG
-Topology authorization backends, packaging, and HTCondor-CE configuration
-snippets.
+Certificate trust uses the standard HTCondor knobs: `AUTH_SSL_CLIENT_CAFILE`,
+`AUTH_SSL_CLIENT_CADIR` and `AUTH_SSL_CLIENT_USE_DEFAULT_CAS` (default true:
+the system trust store is trusted too) for the connections the daemon makes,
+the CE's to the registrar and the registrar's callbacks, and the
+`AUTH_SSL_SERVER_*` variants for the connections it accepts.
+
+Not built yet: the HTTPS approval UI with OIDC login, and the mapfile and OSG
+Topology authorization backends.
