@@ -1,0 +1,97 @@
+name: Browser tests
+
+# Drives the laptop demo (make demo) through the registrar's web UI and the
+# demo identity provider in real browsers. The Go tests reach the same pages
+# with an HTTP client, which applies no Content-Security-Policy, referrer
+# policy or form validation; a browser does.
+
+# One in-flight run per pull request; a new push cancels the previous run.
+# Pushes to main are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  GOWORK: 'off'
+
+jobs:
+  e2e:
+    name: Browser (${{ matrix.browser }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, webkit, firefox]
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Set up Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: '1.27'
+        cache: true
+
+    - name: Set up Node
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: '24'
+        cache: 'npm'
+        cache-dependency-path: e2e/package-lock.json
+
+    - name: Install dependencies
+      working-directory: e2e
+      run: npm ci
+
+    - name: Type check
+      working-directory: e2e
+      run: npm run typecheck
+
+    # The browser download changes only with the Playwright version.
+    - name: Cache Playwright browsers
+      id: pw-cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/ms-playwright
+        key: playwright-${{ runner.os }}-${{ matrix.browser }}-${{ hashFiles('e2e/package-lock.json') }}
+
+    - name: Install browser
+      if: steps.pw-cache.outputs.cache-hit != 'true'
+      working-directory: e2e
+      run: npx playwright install --with-deps ${{ matrix.browser }}
+
+    # The cache holds the browser, not the OS packages it needs.
+    - name: Install browser system deps
+      if: steps.pw-cache.outputs.cache-hit == 'true'
+      working-directory: e2e
+      run: npx playwright install-deps ${{ matrix.browser }}
+
+    - name: Build
+      run: make demo-build
+
+    - name: Run browser tests
+      working-directory: e2e
+      run: npx playwright test
+      env:
+        E2E_SKIP_BUILD: '1'
+        E2E_BROWSERS: ${{ matrix.browser }}
+
+    - name: Upload report
+      if: failure()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: playwright-report-${{ matrix.browser }}
+        path: |
+          e2e/playwright-report/
+          e2e/test-results/
+        retention-days: 7

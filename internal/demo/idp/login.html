@@ -37,10 +37,10 @@ code { font-size: .9em; }
 <form method="post" action="/authorize">
 {{template "hidden" .Req}}
 <div class="other">
-<input name="other" placeholder="any other subject" value="{{.Typed}}" aria-label="Subject">
+<input name="other" placeholder="any other subject" value="{{.Typed}}" aria-label="Subject" required maxlength="64" pattern="[A-Za-z0-9._@\-]{1,64}" title="1 to 64 letters, digits, '.', '_', '@' or '-'" autocomplete="off">
 <button type="submit">Sign in</button>
 </div>
-<button class="cancel" type="submit" name="cancel" value="1">Cancel</button>
+<button class="cancel" type="submit" name="cancel" value="1" formnovalidate>Cancel</button>
 </form>
 <p class="sub">Issuer <code>{{.Issuer}}</code></p>
 </body>

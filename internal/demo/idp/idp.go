@@ -60,6 +60,7 @@ const (
 type Provider struct {
 	cfg  Config
 	page *template.Template
+	csp  string
 
 	mu     sync.Mutex
 	codes  map[string]grant
@@ -88,6 +89,7 @@ func New(cfg Config) *Provider {
 	return &Provider{
 		cfg:    cfg,
 		page:   template.Must(template.ParseFS(files, "login.html")),
+		csp:    loginCSP(cfg.RedirectURI),
 		codes:  map[string]grant{},
 		tokens: map[string]grant{},
 	}
@@ -179,9 +181,21 @@ type loginView struct {
 	Typed  string
 }
 
+// loginCSP is the login page's Content-Security-Policy. Browsers apply
+// form-action to every redirect that follows a form submission, and the
+// login form's answer is a redirect to the client's redirect URI, so its
+// origin must be allowed as well as the provider's own.
+func loginCSP(redirectURI string) string {
+	formAction := "'self'"
+	if u, err := url.Parse(redirectURI); err == nil && u.Scheme != "" && u.Host != "" {
+		formAction += " " + u.Scheme + "://" + u.Host
+	}
+	return "default-src 'none'; style-src 'unsafe-inline'; form-action " + formAction
+}
+
 func (p *Provider) render(w http.ResponseWriter, status int, v loginView) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'")
+	w.Header().Set("Content-Security-Policy", p.csp)
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	if err := p.page.Execute(w, v); err != nil {

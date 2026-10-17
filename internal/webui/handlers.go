@@ -189,10 +189,32 @@ func (s *Server) checkPost(w http.ResponseWriter, r *http.Request, sess *session
 
 func (s *Server) redirectURL() string { return s.cfg.PublicURL + "/oidc/callback" }
 
+// publicHostMarker is a query parameter of a login redirected to the public
+// URL's host.
+const publicHostMarker = "public"
+
+// onPublicHost reports whether r was sent to the public URL's host.
+func (s *Server) onPublicHost(r *http.Request) bool {
+	scheme, _, _ := strings.Cut(s.cfg.PublicURL, "://")
+	o, err := canonicalOrigin(scheme + "://" + r.Host)
+	return err == nil && o == s.cfg.PublicURL
+}
+
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	next := r.URL.Query().Get("next")
 	if !safeNext(next) {
 		next = "/approve"
+	}
+	if !s.onPublicHost(r) && r.URL.Query().Get(publicHostMarker) == "" {
+		// The state cookie set below goes back only to this host, and the
+		// provider returns the browser to the public URL's, so a login
+		// started under another name for this server (127.0.0.1 for
+		// localhost, say) could never finish. Start it again there. The
+		// marker stops a second redirect when a proxy rewrites the Host
+		// header.
+		http.Redirect(w, r, s.cfg.PublicURL+"/login?"+url.Values{"next": {next}, publicHostMarker: {"1"}}.Encode(),
+			http.StatusSeeOther)
+		return
 	}
 	ep, err := s.oidc.endpoints(r.Context())
 	if err != nil {
@@ -220,8 +242,25 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	bound := s.cookie(r, loginCookie)
 	s.setCookie(w, loginCookie, "", -1)
 	if e := q.Get("error"); e != "" {
-		s.log.Warn("webui: identity provider refused the login", "error", e, "description", q.Get("error_description"))
-		s.message(w, r, http.StatusUnauthorized, "Sign-in failed", "The identity provider did not sign you in.")
+		// The login is over either way; offer to start another that
+		// returns to the same page, when this browser started this one.
+		next := "/approve"
+		if state != "" && bound != "" && secret.Equal(state, bound) {
+			if _, n, ok := s.logins.take(state); ok && safeNext(n) {
+				next = n
+			}
+		}
+		page := messagePage{Heading: "Sign-in failed", Text: "The identity provider did not sign you in.",
+			LinkHref: "/login?next=" + url.QueryEscape(next), LinkText: "Sign in"}
+		status := http.StatusUnauthorized
+		if e == "access_denied" {
+			s.log.Info("webui: sign-in cancelled or denied at the identity provider", "client", s.clientIP(r))
+			page.Heading, page.Text, status = "Sign-in cancelled", "The identity provider did not sign you in: access was denied.", http.StatusOK
+		} else {
+			s.log.Warn("webui: identity provider refused the login", "error", e, "description", q.Get("error_description"))
+		}
+		page.base = s.base(r, page.Heading)
+		s.render(w, status, "message", page)
 		return
 	}
 	if state == "" || code == "" || bound == "" || !secret.Equal(state, bound) {
@@ -345,8 +384,14 @@ func (s *Server) lookupRequest(w http.ResponseWriter, r *http.Request, sess *ses
 		s.message(w, r, http.StatusGone, "Request expired",
 			"The request from "+rec.Name+" with code "+code+" expired at "+utc(rec.ExpiresAt)+".")
 	case rec.Status == registrar.ReqApproved:
+		// The request is claimed only when the CE first renews; until then a
+		// registration means its token was issued.
+		state := " The CE has not collected its token yet."
+		if rec.RegistrationID != "" {
+			state = " The registrar has issued the CE its token."
+		}
 		s.message(w, r, http.StatusOK, "Request approved",
-			"The request from "+rec.Name+" was approved"+by+" at "+utc(rec.DecidedAt)+". The CE has not collected its token yet.")
+			"The request from "+rec.Name+" was approved"+by+" at "+utc(rec.DecidedAt)+"."+state)
 	case rec.Status == registrar.ReqClaimed:
 		s.message(w, r, http.StatusOK, "Request approved",
 			"The request from "+rec.Name+" was approved"+by+" at "+utc(rec.DecidedAt)+". The CE has collected its token.")

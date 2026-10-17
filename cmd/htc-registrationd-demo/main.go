@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -38,6 +39,7 @@ func main() {
 	condorBin := fs.String("condor-bin", "", "directory holding condor_collector (default: $CONDOR_BIN, then PATH)")
 	noCollector := fs.Bool("no-collector", false, "do not start an HTCondor collector")
 	lifetime := fs.Duration("token-lifetime", 10*time.Minute, "token lifetime; CEs renew at half of it")
+	readyFile := fs.String("ready-file", "", "once the demo is up, write its URLs, files and ce2's approval code to this file as JSON (default DIR/ready.json)")
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, usage)
 		fs.PrintDefaults()
@@ -57,7 +59,10 @@ func main() {
 	}
 	switch cmd {
 	case "run":
-		os.Exit(run(d))
+		if *readyFile == "" {
+			*readyFile = filepath.Join(d.Root(), demo.ReadyFile)
+		}
+		os.Exit(run(d, *readyFile))
 	case "status":
 		os.Exit(status(d, *daemon))
 	case "cli":
@@ -85,9 +90,13 @@ func fatal(err error) {
 	os.Exit(1)
 }
 
-func run(d *demo.Demo) int {
+func run(d *demo.Demo, readyFile string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// A file left by an earlier run must not be taken for this one.
+	if err := os.Remove(readyFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+		fatal(err)
+	}
 	d.Say("starting; state in %s", d.Root())
 	if err := d.Start(ctx); err != nil {
 		if ctx.Err() == nil {
@@ -97,6 +106,11 @@ func run(d *demo.Demo) int {
 		return 0
 	}
 	d.PrintBanner()
+	if err := d.WriteReady(readyFile); err != nil {
+		d.Say("writing %s: %v; stopping the demo", readyFile, err)
+		d.Stop()
+		return 1
+	}
 	err := d.Wait(ctx)
 	if err != nil {
 		d.Say("%v; stopping the demo", err)
@@ -104,6 +118,7 @@ func run(d *demo.Demo) int {
 		d.Say("stopping")
 	}
 	d.Stop()
+	_ = os.Remove(readyFile)
 	d.Say("stopped; state kept in %s", d.Root())
 	if err != nil {
 		return 1

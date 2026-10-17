@@ -4,7 +4,7 @@ LDFLAGS := -X main.version=$(VERSION)
 export GOWORK := off
 
 .PHONY: all build test test-race vet lint fmt clean rpm rpm-build \
-	demo demo-build demo-status demo-revoke demo-renew demo-request demo-approve demo-advertise demo-clean
+	demo demo-build demo-status demo-revoke demo-renew demo-request demo-approve demo-advertise demo-clean e2e
 
 all: build
 
@@ -60,8 +60,8 @@ demo-request: demo-build
 	@$(DEMO) cli $(CE) request --approval
 
 demo-approve: demo-build
-	@test -n "$(CODE)" || { echo "usage: make demo-approve CODE=XXXX-XXXX"; exit 2; }
-	@$(DEMO) cli registrar approve $(CODE)
+	@test -n "$(CODE)" -a -n "$(NAME)" || { echo "usage: make demo-approve CODE=XXXX-XXXX NAME=ce2.localhost"; exit 2; }
+	@$(DEMO) cli registrar approve $(CODE) $(NAME)
 
 demo-advertise: demo-build
 	@test -n "$(CE)" -a -n "$(NAME)" || { echo "usage: make demo-advertise CE=ce1 NAME=ce2.localhost"; exit 2; }
@@ -69,6 +69,21 @@ demo-advertise: demo-build
 
 demo-clean:
 	rm -rf $(DEMO_DIR)
+
+# --- Browser tests ---------------------------------------------------------
+# `make e2e` drives the demo through the registrar's web UI and the identity
+# provider in real browsers (Playwright, under e2e/). Each browser gets a
+# demo of its own, with no HTCondor collector unless CONDOR_BIN is set.
+# Needs Node.js 20 or newer. E2E_BROWSERS is any of chromium, webkit and
+# firefox.
+
+E2E_BROWSERS ?= chromium
+
+e2e: demo-build
+	@command -v npm >/dev/null 2>&1 || { echo "npm not found: install Node.js 20 or newer"; exit 1; }
+	cd e2e && { test node_modules -nt package-lock.json || npm ci; }
+	cd e2e && npx playwright install $(E2E_BROWSERS)
+	cd e2e && E2E_SKIP_BUILD=1 E2E_BROWSERS="$(E2E_BROWSERS)" npx playwright test
 
 # --- RPM packaging -------------------------------------------------------
 
