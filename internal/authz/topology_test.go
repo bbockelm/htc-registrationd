@@ -277,13 +277,11 @@ func TestTopologyIncludeITB(t *testing.T) {
 	if got, _ := query.Load().(string); got != want {
 		t.Errorf("fetched %q, want %q", got, want)
 	}
-	for knob, want := range map[string]bool{"": false, "false": false, "true": true} {
+	// An invalid value keeps the default, as HTCondor's param_boolean does.
+	for knob, want := range map[string]bool{"": false, "false": false, "true": true, "maybe": false} {
 		tc, err := topologyConfig(knobs.Map{"HTC_REGISTRATIOND_TOPOLOGY_INCLUDE_ITB": knob}, nil)
 		if err != nil || tc.IncludeITB != want {
 			t.Errorf("INCLUDE_ITB = %q: %v, %v", knob, tc.IncludeITB, err)
 		}
-	}
-	if _, err := topologyConfig(knobs.Map{"HTC_REGISTRATIOND_TOPOLOGY_INCLUDE_ITB": "maybe"}, nil); err == nil {
-		t.Error("INCLUDE_ITB = maybe accepted")
 	}
 }

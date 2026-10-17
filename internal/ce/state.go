@@ -49,11 +49,27 @@ type State struct {
 	TokenIssuedAt    int64 `json:"token_issued_at,omitempty"`
 	TokenExpiry      int64 `json:"token_expiry,omitempty"`
 	TokenInstalledAt int64 `json:"token_installed_at,omitempty"`
-	// LastReconfig is when the local master was last told to reconfigure
-	// after a token install; startup reconfigures again if the installed
-	// token is newer.
+	// TokenRenewAt is when the installed token is due for renewal, drawn
+	// once per token with jitter so a fleet of CEs does not renew in step.
+	TokenRenewAt int64 `json:"token_renew_at,omitempty"`
+	// TokenFile is where the token was installed, so a changed token
+	// directory leaves no stale copy behind.
+	TokenFile string `json:"token_file,omitempty"`
+	// LastReconfig is when the local master last reconfigured after a
+	// token install.
 	LastReconfig int64 `json:"last_reconfig,omitempty"`
+	// TokenGeneration counts token installs; ReconfiguredGeneration is the
+	// newest install the local master has been told about. While the first
+	// is ahead, the daemon keeps retrying the reconfig, whether the install
+	// came from a renewal, a callback that finished after its request gave
+	// up, or before a crash.
+	TokenGeneration        int64 `json:"token_generation,omitempty"`
+	ReconfiguredGeneration int64 `json:"reconfigured_generation,omitempty"`
 }
+
+// NeedsReconfig reports whether a token was installed after the local
+// master's last reconfig.
+func (s State) NeedsReconfig() bool { return s.TokenGeneration > s.ReconfiguredGeneration }
 
 // Newest returns the refresh secret to present: pending if set, else current.
 func (s *State) Newest() string {
@@ -68,9 +84,13 @@ func (s *State) HasToken(now time.Time) bool {
 	return s.TokenExpiry != 0 && now.Before(time.Unix(s.TokenExpiry, 0))
 }
 
-// RenewAt returns when the installed token is due for renewal: fraction of
-// the way through its lifetime.
+// RenewAt returns when the installed token is due for renewal: TokenRenewAt
+// when it was drawn at install, else fraction of the way through its
+// lifetime.
 func (s *State) RenewAt(fraction float64) time.Time {
+	if s.TokenRenewAt != 0 {
+		return time.Unix(s.TokenRenewAt, 0)
+	}
 	issued, exp := time.Unix(s.TokenIssuedAt, 0), time.Unix(s.TokenExpiry, 0)
 	if s.TokenIssuedAt == 0 || !exp.After(issued) {
 		return exp
@@ -103,6 +123,14 @@ func LoadState(dir string) (*State, error) {
 	if err := json.Unmarshal(data, &s); err != nil {
 		return nil, fmt.Errorf("parsing %s: %w", RegistrationFile, err)
 	}
+	if s.TokenGeneration == 0 && s.TokenInstalledAt != 0 {
+		// Written before generations were kept: reconfigure unless the last
+		// reconfig was after the install.
+		s.TokenGeneration = 1
+		if s.LastReconfig > s.TokenInstalledAt {
+			s.ReconfiguredGeneration = 1
+		}
+	}
 	return &s, nil
 }
 
@@ -118,24 +146,23 @@ func SaveState(dir string, s *State) error {
 // Status is status.json and the REG_STATUS reply: what an operator wants to
 // know. It carries no secrets.
 type Status struct {
-	State                   string `json:"state"`
-	Method                  string `json:"method,omitempty"`
-	Name                    string `json:"name,omitempty"`
-	Registrar               string `json:"registrar,omitempty"`
-	RegistrationID          string `json:"registration_id,omitempty"`
-	TokenFile               string `json:"token_file,omitempty"`
-	TokenExpiry             int64  `json:"token_expiry,omitempty"`
-	NextRenewal             int64  `json:"next_renewal,omitempty"`
-	LastSuccess             int64  `json:"last_success,omitempty"`
-	LastError               string `json:"last_error,omitempty"`
-	LastErrorTime           int64  `json:"last_error_time,omitempty"`
-	ApprovalURL             string `json:"approval_url,omitempty"`
-	UserCode                string `json:"user_code,omitempty"`
-	RequestExpires          int64  `json:"request_expires,omitempty"`
-	LastPingTime            int64  `json:"last_ping_time,omitempty"`
-	LastPingResult          string `json:"last_ping_result,omitempty"`
-	UpdatedAt               int64  `json:"updated_at"`
-	VerificationURIComplete string `json:"-"`
+	State          string `json:"state"`
+	Method         string `json:"method,omitempty"`
+	Name           string `json:"name,omitempty"`
+	Registrar      string `json:"registrar,omitempty"`
+	RegistrationID string `json:"registration_id,omitempty"`
+	TokenFile      string `json:"token_file,omitempty"`
+	TokenExpiry    int64  `json:"token_expiry,omitempty"`
+	NextRenewal    int64  `json:"next_renewal,omitempty"`
+	LastSuccess    int64  `json:"last_success,omitempty"`
+	LastError      string `json:"last_error,omitempty"`
+	LastErrorTime  int64  `json:"last_error_time,omitempty"`
+	ApprovalURL    string `json:"approval_url,omitempty"`
+	UserCode       string `json:"user_code,omitempty"`
+	RequestExpires int64  `json:"request_expires,omitempty"`
+	LastPingTime   int64  `json:"last_ping_time,omitempty"`
+	LastPingResult string `json:"last_ping_result,omitempty"`
+	UpdatedAt      int64  `json:"updated_at"`
 }
 
 // States reported in Status.State.

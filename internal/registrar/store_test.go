@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -57,6 +58,7 @@ func newStoreFixture(t *testing.T) *storeFixture {
 		KeyDir: keyDir, KeyID: "ce-registration", Issuer: "pool.test", Domain: "users.test",
 		Limits: []string{"ADVERTISE_SCHEDD"}, Lifetime: 72 * time.Hour,
 		ReadKey: os.ReadFile, // test keys are the test user's
+		Now:     clock.Now,
 	}
 	return &storeFixture{store: st, clock: clock, minter: m}
 }
@@ -94,8 +96,12 @@ func (f *storeFixture) poll(t *testing.T, requestID, nonce string) *PollResult {
 	return res
 }
 
+// defaultRenewOptions are the registrar's defaults for the policies that bear
+// on an honest CE: the reissue cap and the refresh idle lifetime.
+var defaultRenewOptions = RenewOptions{MaxReissues: 5, IdleLifetime: 30 * 24 * time.Hour}
+
 func (f *storeFixture) renew(regID, presented string) (*RenewResult, error) {
-	return f.store.Renew(context.Background(), regID, presented, RenewOptions{}, f.minter.Mint)
+	return f.store.Renew(context.Background(), regID, presented, defaultRenewOptions, f.minter.Mint)
 }
 
 func (f *storeFixture) secrets(t *testing.T, regID string) (SecretState, string) {
@@ -218,7 +224,8 @@ func TestRenewTable(t *testing.T) {
 // registration passes through before its first proof.
 func TestClassifyTable(t *testing.T) {
 	h := secret.Hash
-	st := SecretState{Current: h("cur"), Pending: h("pend"), Retired: []string{h("old1"), h("old2")}}
+	st := SecretState{Current: h("cur"), Pending: h("pend"), Retired: []string{h("old1"), h("old2")},
+		Replaced: []string{h("dropped")}}
 	cases := []struct {
 		st      SecretState
 		present string
@@ -228,6 +235,7 @@ func TestClassifyTable(t *testing.T) {
 		{st, "cur", RenewReissue},
 		{st, "old1", RenewReuse},
 		{st, "old2", RenewReuse},
+		{st, "dropped", RenewReuse},
 		{st, "other", RenewReject},
 		{SecretState{Pending: h("first")}, "first", RenewPromote}, // first issuance
 		{SecretState{Pending: h("first")}, "", RenewReject},       // empty never matches empty current
@@ -244,6 +252,185 @@ func TestClassifyTable(t *testing.T) {
 	got := Apply(SecretState{Pending: h("first")}, RenewPromote, h("next"))
 	if got.Current != h("first") || got.Pending != h("next") || len(got.Retired) != 0 {
 		t.Errorf("first promotion: %+v", got)
+	}
+	// A reissue records the dropped pending as replaced and counts; a
+	// promotion resets the count.
+	got = Apply(st, RenewReissue, h("next"))
+	if got.Pending != h("next") || got.Replaced[len(got.Replaced)-1] != h("pend") || got.Reissues != 1 {
+		t.Errorf("reissue: %+v", got)
+	}
+	if got = Apply(got, RenewPromote, h("after")); got.Reissues != 0 || got.Current != h("next") {
+		t.Errorf("promotion after a reissue: %+v", got)
+	}
+}
+
+// TestSupersededListsBounded: the retired and replaced lists keep only the
+// newest MaxSupersededHashes.
+func TestSupersededListsBounded(t *testing.T) {
+	st := SecretState{Current: secret.Hash("c0"), Pending: secret.Hash("p0")}
+	for i := 0; i < 3*MaxSupersededHashes; i++ {
+		st = Apply(st, RenewReissue, secret.Hash(fmt.Sprintf("r%d", i)))
+		st = Apply(st, RenewPromote, secret.Hash(fmt.Sprintf("n%d", i)))
+	}
+	if len(st.Retired) != MaxSupersededHashes || len(st.Replaced) != MaxSupersededHashes {
+		t.Fatalf("retired %d replaced %d, want %d each", len(st.Retired), len(st.Replaced), MaxSupersededHashes)
+	}
+	// The newest are the ones kept.
+	if st.Retired[len(st.Retired)-1] != secret.Hash(fmt.Sprintf("r%d", 3*MaxSupersededHashes-2)) {
+		t.Fatal("the newest retired hash was not kept")
+	}
+}
+
+// TestHonestCENeverRevoked walks every sequence of renewal outcomes of a
+// given length, against the decision table alone, for a single serialized CE
+// that presents its newest stored secret and stores a reply before using it:
+// no sequence ever presents a superseded or unknown secret, and the reissue
+// cap is reached only by MaxReissues+1 renewals in a row whose replies the
+// CE never stored.
+func TestHonestCENeverRevoked(t *testing.T) {
+	const length, maxReissues = 7, 5
+	points := []crashPoint{noCrash, replyLost, crashBeforePersist, crashBeforeInstall, crashBeforeReconfig}
+	seq := make([]crashPoint, length)
+	n := 0
+	var walk func(i int)
+	walk = func(i int) {
+		if i < length {
+			for _, p := range points {
+				seq[i] = p
+				walk(i + 1)
+			}
+			return
+		}
+		n++
+		reg := SecretState{Pending: secret.Hash("s0")}
+		ceCur, cePend := "", "s0"
+		lostInARow := 0
+		for step, crash := range seq {
+			presented := cePend
+			if presented == "" {
+				presented = ceCur
+			}
+			action := Classify(reg, presented)
+			switch action {
+			case RenewReject, RenewReuse:
+				t.Fatalf("sequence %v: step %d presented a secret classified %s", seq, step, action)
+			}
+			if action == RenewReissue && reg.Reissues >= maxReissues {
+				if lostInARow < maxReissues {
+					t.Fatalf("sequence %v: step %d hit the reissue cap after %d lost replies", seq, step, lostInARow)
+				}
+				return // capped: this CE never stored a reply
+			}
+			issued := fmt.Sprintf("s%d", step+1)
+			reg = Apply(reg, action, secret.Hash(issued))
+			if crash == replyLost || crash == crashBeforePersist {
+				lostInARow++
+				continue
+			}
+			lostInARow = 0
+			ceCur, cePend = presented, issued
+		}
+	}
+	walk(0)
+	if n != 78125 {
+		t.Fatalf("walked %d sequences", n)
+	}
+}
+
+// TestPingPongTheft: a thief with a copy of registration.json presents the
+// saved current secret, three times for every renewal of the real CE. Each
+// of its reissues replaces the CE's pending secret; the CE presenting a
+// replaced secret revokes the registration within the first round, and
+// nobody renews after that.
+func TestPingPongTheft(t *testing.T) {
+	f := newStoreFixture(t)
+	reqID, nonce, _ := f.approvedRequest(t)
+	p := f.poll(t, reqID, nonce)
+	victim := &ceState{regID: p.RegistrationID, pending: p.RefreshSecret}
+	if err := ceRenew(f, victim, noCrash); err != nil {
+		t.Fatal(err)
+	}
+	thiefCurrent := victim.current // the copy's current secret, presented forever
+	revokedAt := -1
+	for round := 0; round < 4 && revokedAt < 0; round++ {
+		for i := 0; i < 3; i++ {
+			if _, err := f.renew(victim.regID, thiefCurrent); err != nil {
+				revokedAt = round
+				break
+			}
+		}
+		if revokedAt >= 0 {
+			break
+		}
+		if err := ceRenew(f, victim, noCrash); err != nil {
+			var rerr *RenewError
+			if !errors.As(err, &rerr) || rerr.Code != protocol.ErrRevoked {
+				t.Fatalf("round %d: the real CE's renewal failed with %v, want revoked", round, err)
+			}
+			revokedAt = round
+		}
+	}
+	if revokedAt != 0 {
+		t.Fatalf("revoked in round %d, want the first", revokedAt)
+	}
+	if _, status := f.secrets(t, victim.regID); status != RegRevoked {
+		t.Fatalf("status %s, want revoked", status)
+	}
+	if _, err := f.renew(victim.regID, thiefCurrent); err == nil {
+		t.Fatal("the thief renewed a revoked registration")
+	}
+}
+
+// TestReissueCap: a copy that only ever presents the current secret while the
+// real CE is away gets MaxReissues tokens, then the registration is revoked.
+func TestReissueCap(t *testing.T) {
+	f := newStoreFixture(t)
+	reqID, nonce, _ := f.approvedRequest(t)
+	p := f.poll(t, reqID, nonce)
+	ce := &ceState{regID: p.RegistrationID, pending: p.RefreshSecret}
+	if err := ceRenew(f, ce, noCrash); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < defaultRenewOptions.MaxReissues; i++ {
+		res, err := f.renew(ce.regID, ce.current)
+		if err != nil {
+			t.Fatalf("reissue %d: %v", i+1, err)
+		}
+		if res.Action != RenewReissue {
+			t.Fatalf("reissue %d: action %s", i+1, res.Action)
+		}
+	}
+	_, err := f.renew(ce.regID, ce.current)
+	var rerr *RenewError
+	if !errors.As(err, &rerr) || rerr.Code != protocol.ErrRevoked {
+		t.Fatalf("reissue %d: %v, want revoked", defaultRenewOptions.MaxReissues+1, err)
+	}
+	reg, _ := f.store.Registration(context.Background(), ce.regID)
+	if reg.Status != RegRevoked || !strings.Contains(reg.RevokeReason, "in a row") {
+		t.Fatalf("registration %s (%s)", reg.Status, reg.RevokeReason)
+	}
+}
+
+// TestRefreshOutlivesToken: the refresh secret stays usable after the token
+// expired, until it has been idle for IdleLifetime.
+func TestRefreshOutlivesToken(t *testing.T) {
+	f := newStoreFixture(t)
+	reqID, nonce, _ := f.approvedRequest(t)
+	p := f.poll(t, reqID, nonce)
+	f.clock.Advance(10 * 24 * time.Hour) // the 72 h token is long expired
+	r, err := f.renew(p.RegistrationID, p.RefreshSecret)
+	if err != nil {
+		t.Fatalf("renewal after the token expired: %v", err)
+	}
+	f.verify(t, r.Token.Raw)
+	f.clock.Advance(defaultRenewOptions.IdleLifetime + time.Hour)
+	_, err = f.renew(p.RegistrationID, r.RefreshSecret)
+	var rerr *RenewError
+	if !errors.As(err, &rerr) || rerr.Code != protocol.ErrExpired {
+		t.Fatalf("renewal after the idle lifetime: %v, want expired", err)
+	}
+	if _, status := f.secrets(t, p.RegistrationID); status != RegExpired {
+		t.Fatalf("status %s, want expired", status)
 	}
 }
 
@@ -367,9 +554,9 @@ func TestCrashStorm(t *testing.T) {
 		// The invariant is about the newest stored secret only: after a lost
 		// reply the CE's older "current" may legitimately be retired, which is
 		// harmless because the CE never presents it while its newest works.
-		for _, r := range st.Retired {
+		for _, r := range append(append([]string(nil), st.Retired...), st.Replaced...) {
 			if r == h {
-				t.Fatalf("step %d: the CE's newest stored secret was retired", i)
+				t.Fatalf("step %d: the CE's newest stored secret was superseded", i)
 			}
 		}
 	}

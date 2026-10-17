@@ -9,6 +9,14 @@ import (
 	"testing"
 )
 
+// isDenied reports whether err is the policy refusing an address or a
+// sinful.
+func isDenied(err error) bool {
+	var d *DeniedError
+	var s *SinfulError
+	return errors.As(err, &d) || errors.As(err, &s)
+}
+
 func newTestPolicy(t *testing.T, allow string, local ...string) *Policy {
 	t.Helper()
 	prefixes, err := ParseAllowList(allow)
@@ -27,16 +35,29 @@ func newTestPolicy(t *testing.T, allow string, local ...string) *Policy {
 }
 
 func TestCheckAddrDefaults(t *testing.T) {
-	p := newTestPolicy(t, "", "198.51.100.7", "2001:db8:aaaa::7")
+	p := newTestPolicy(t, "", "128.104.1.7", "2607:f388:aaaa::7")
 	cases := []struct {
 		addr  string
 		allow bool
 	}{
 		// Public addresses.
 		{"8.8.8.8", true},
-		{"192.0.2.10", true}, // TEST-NET-1 is not in the denied list
+		{"128.104.1.10", true},
 		{"2606:4700::1111", true},
-		{"2001:db8::1", true},
+		{"2001:db9::1", true},
+		{"198.17.255.255", true}, // just below benchmarking
+		{"198.20.0.0", true},     // just past benchmarking
+
+		// Documentation, benchmarking and special-purpose ranges.
+		{"192.0.2.10", false},
+		{"198.51.100.1", false},
+		{"203.0.113.1", false},
+		{"198.18.0.1", false},
+		{"198.19.255.255", false},
+		{"192.0.0.8", false},
+		{"168.63.129.16", false}, // Azure WireServer
+		{"168.63.129.17", true},
+		{"2001:db8::1", false},
 
 		// IPv4 denials.
 		{"0.0.0.0", false},
@@ -82,12 +103,16 @@ func TestCheckAddrDefaults(t *testing.T) {
 		{"2002:7f00:1::1", false},     // 6to4 of 127.0.0.1
 		{"2002:c0a8:101::1", false},   // 6to4 of 192.168.1.1
 		{"2002:808:808::1", true},     // 6to4 of 8.8.8.8
+		{"::ffff:0:7f00:1", false},    // SIIT of 127.0.0.1
+		{"::ffff:0:a9fe:a9fe", false}, // SIIT of 169.254.169.254
+		{"::ffff:0:808:808", true},    // SIIT of 8.8.8.8
+		{"64:ff9b::c000:20a", false},  // NAT64 of 192.0.2.10
 
 		// The registrar's own interfaces.
-		{"198.51.100.7", false},
-		{"::ffff:198.51.100.7", false},
-		{"2001:db8:aaaa::7", false},
-		{"198.51.100.8", true},
+		{"128.104.1.7", false},
+		{"::ffff:128.104.1.7", false},
+		{"2607:f388:aaaa::7", false},
+		{"128.104.1.8", true},
 	}
 	for _, tc := range cases {
 		err := p.CheckAddr(netip.MustParseAddr(tc.addr))
@@ -97,8 +122,8 @@ func TestCheckAddrDefaults(t *testing.T) {
 		if !tc.allow {
 			if err == nil {
 				t.Errorf("%s: allowed, want denied", tc.addr)
-			} else if !errors.Is(err, ErrDenied) {
-				t.Errorf("%s: error %v does not match ErrDenied", tc.addr, err)
+			} else if !isDenied(err) {
+				t.Errorf("%s: error %v is not a denial", tc.addr, err)
 			}
 		}
 	}
@@ -141,10 +166,10 @@ func TestParseAllowList(t *testing.T) {
 // including one a name was resolved to.
 func TestControl(t *testing.T) {
 	p := newTestPolicy(t, "")
-	if err := p.Control("tcp", "127.0.0.1:9618", nil); !errors.Is(err, ErrDenied) {
+	if err := p.Control("tcp", "127.0.0.1:9618", nil); !isDenied(err) {
 		t.Errorf("loopback: %v, want denied", err)
 	}
-	if err := p.Control("tcp6", "[fe80::1%lo0]:9618", nil); !errors.Is(err, ErrDenied) {
+	if err := p.Control("tcp6", "[fe80::1%lo0]:9618", nil); !isDenied(err) {
 		t.Errorf("link-local with zone: %v, want denied", err)
 	}
 	if err := p.Control("tcp", "8.8.8.8:9618", nil); err != nil {
@@ -177,8 +202,8 @@ func TestControlInDialer(t *testing.T) {
 	if c, err := d.DialContext(context.Background(), "tcp", ln.Addr().String()); err == nil {
 		_ = c.Close()
 		t.Fatal("dial to loopback succeeded through the hook")
-	} else if !errors.Is(err, ErrDenied) {
-		t.Fatalf("dial error %v does not match ErrDenied", err)
+	} else if !isDenied(err) {
+		t.Fatalf("dial error %v is not a denial", err)
 	}
 
 	d = net.Dialer{Control: newTestPolicy(t, "127.0.0.0/8").Control}
@@ -195,8 +220,8 @@ func TestCheckSinful(t *testing.T) {
 		name, sinful, dial, errHas string
 	}{
 		{name: "public IP with shared port",
-			sinful: "<192.0.2.10:9619?addrs=192.0.2.10-9619&sock=htc_registrationd>",
-			dial:   "<192.0.2.10:9619?addrs=192.0.2.10-9619&sock=htc_registrationd>"},
+			sinful: "<128.104.1.10:9619?addrs=128.104.1.10-9619&sock=htc_registrationd>",
+			dial:   "<128.104.1.10:9619?addrs=128.104.1.10-9619&sock=htc_registrationd>"},
 		// Host names are left for cedar to resolve; the dial hook checks the
 		// addresses they resolve to.
 		{name: "host name is not resolved",
@@ -206,21 +231,22 @@ func TestCheckSinful(t *testing.T) {
 			sinful: "<localhost:9619>",
 			dial:   "<localhost:9619>"},
 		{name: "ipv6 literal",
-			sinful: "<[2001:db8::11]:9619>",
-			dial:   "<[2001:db8::11]:9619>"},
+			sinful: "<[2607:f388::11]:9619>",
+			dial:   "<[2607:f388::11]:9619>"},
 		{name: "bare host:port",
-			sinful: "192.0.2.10:9618",
-			dial:   "<192.0.2.10:9618>"},
+			sinful: "128.104.1.10:9618",
+			dial:   "<128.104.1.10:9618>"},
+		{name: "documentation literal", sinful: "<192.0.2.10:9619>", errHas: "documentation"},
 		{name: "loopback literal", sinful: "<127.0.0.1:9619>", errHas: "loopback"},
 		{name: "metadata service literal", sinful: "<169.254.169.254:80>", errHas: "link-local"},
-		{name: "private addrs entry", sinful: "<192.0.2.10:9619?addrs=192.0.2.10-9619+10.0.0.1-9619>", errHas: "RFC 1918"},
-		{name: "ipv6 loopback addrs entry", sinful: "<192.0.2.10:9619?addrs=[::1]-9619>", errHas: "loopback"},
-		{name: "CCB contact", sinful: "<10.0.0.5:9619?CCBID=192.0.2.1:9618#42&sock=x>", errHas: "CCB"},
-		{name: "lower-case ccbid", sinful: "<192.0.2.10:9619?ccbid=192.0.2.1:9618#42>", errHas: "CCB"},
-		{name: "private network part", sinful: "<192.0.2.10:9619?PrivNet=site&PrivAddr=%3c10.0.0.5:9619%3e>", errHas: "private-network"},
-		{name: "no port", sinful: "<192.0.2.10>", errHas: "host:port"},
-		{name: "zero port", sinful: "<192.0.2.10:0>", errHas: "bad port"},
-		{name: "bad sock", sinful: "<192.0.2.10:9619?sock=../../x>", errHas: "shared-port"},
+		{name: "private addrs entry", sinful: "<128.104.1.10:9619?addrs=128.104.1.10-9619+10.0.0.1-9619>", errHas: "RFC 1918"},
+		{name: "ipv6 loopback addrs entry", sinful: "<128.104.1.10:9619?addrs=[::1]-9619>", errHas: "loopback"},
+		{name: "CCB contact", sinful: "<10.0.0.5:9619?CCBID=128.104.1.1:9618#42&sock=x>", errHas: "CCB"},
+		{name: "lower-case ccbid", sinful: "<128.104.1.10:9619?ccbid=128.104.1.1:9618#42>", errHas: "CCB"},
+		{name: "private network part", sinful: "<128.104.1.10:9619?PrivNet=site&PrivAddr=%3c10.0.0.5:9619%3e>", errHas: "private-network"},
+		{name: "no port", sinful: "<128.104.1.10>", errHas: "host:port"},
+		{name: "zero port", sinful: "<128.104.1.10:0>", errHas: "bad port"},
+		{name: "bad sock", sinful: "<128.104.1.10:9619?sock=../../x>", errHas: "shared-port"},
 		{name: "mapped loopback literal", sinful: "<[::ffff:127.0.0.1]:9619>", errHas: "loopback"},
 	}
 	for _, tc := range cases {
@@ -233,8 +259,8 @@ func TestCheckSinful(t *testing.T) {
 				if !strings.Contains(err.Error(), tc.errHas) {
 					t.Fatalf("error %q does not contain %q", err, tc.errHas)
 				}
-				if !errors.Is(err, ErrDenied) {
-					t.Fatalf("error %v does not match ErrDenied", err)
+				if !isDenied(err) {
+					t.Fatalf("error %v is not a denial", err)
 				}
 				return
 			}

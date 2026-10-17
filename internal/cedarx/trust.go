@@ -22,40 +22,31 @@ import (
 // CAFile empty. golang-htcondor's GetSecurityConfig / GetServerSecurityConfig
 // do not read the CADIR and USE_DEFAULT_CAS knobs yet; once they do, and fill
 // the CA file regardless of the method list, this helper can be deleted.
-//
-// An unparseable USE_DEFAULT_CAS is an error, as it is a fatal configuration
-// error in HTCondor; sc is left unchanged then.
-func SSLTrust(cfg knobs.Getter, side string, sc *security.SecurityConfig) error {
-	useDefault, err := knobs.Bool(cfg, "AUTH_SSL_"+side+"_USE_DEFAULT_CAS", true)
-	if err != nil {
-		return err
-	}
+func SSLTrust(cfg knobs.Getter, side string, sc *security.SecurityConfig) {
+	useDefault := knobs.Bool(cfg, "AUTH_SSL_"+side+"_USE_DEFAULT_CAS", true)
 	sc.CAFile = knobs.String(cfg, "AUTH_SSL_"+side+"_CAFILE", "")
 	sc.CADir = knobs.String(cfg, "AUTH_SSL_"+side+"_CADIR", "")
 	sc.UseDefaultCAs = &useDefault
-	return nil
 }
 
-// ServerSSLTrust applies SSLTrust's SERVER knobs to srv's base security config
-// and to every per-command config srv derives. Call it after the per-command
-// policy is installed (and after HardenCommands).
-func ServerSSLTrust(cfg knobs.Getter, srv *cedarserver.Server) error {
-	if err := SSLTrust(cfg, "SERVER", srv.SecurityConfig); err != nil {
-		return err
-	}
-	trust := *srv.SecurityConfig
+// ServerSSLTrust applies SSLTrust's SERVER knobs, read from the current
+// configuration (cfg) at every handshake, to every per-command config srv
+// derives, the base one included, so a reconfig takes effect for the next
+// connection. Call it after the per-command policy is installed (and after
+// HardenCommands).
+func ServerSSLTrust(cfg func() knobs.Getter, srv *cedarserver.Server) {
+	SSLTrust(cfg(), "SERVER", srv.SecurityConfig)
 	prev := srv.SecurityConfigForCommand
-	if prev == nil {
-		return nil
-	}
 	srv.SecurityConfigForCommand = func(cmd int) *security.SecurityConfig {
-		sc := prev(cmd)
-		if sc == nil || sc == srv.SecurityConfig {
-			return sc
+		var sc *security.SecurityConfig
+		if prev != nil {
+			sc = prev(cmd)
+		}
+		if sc == nil {
+			sc = srv.SecurityConfig
 		}
 		c := *sc
-		c.CAFile, c.CADir, c.UseDefaultCAs = trust.CAFile, trust.CADir, trust.UseDefaultCAs
+		SSLTrust(cfg(), "SERVER", &c)
 		return &c
 	}
-	return nil
 }

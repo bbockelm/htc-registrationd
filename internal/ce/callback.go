@@ -109,7 +109,7 @@ func (m *Manager) requestCallback(ctx context.Context) error {
 	st := cl.GetStream()
 	if err := protocol.Send(ctx, st, &protocol.Request{
 		Name: m.cfg.Name, Method: protocol.MethodCallback, CallbackAddress: addr, Nonce: nonce,
-		Limits: m.cfg.Limits, CEVersion: m.cfg.Version,
+		CEVersion: m.cfg.Version,
 	}); err != nil {
 		return err
 	}
@@ -122,7 +122,7 @@ func (m *Manager) requestCallback(ctx context.Context) error {
 	}
 	m.setRequestID(lr, reply.RequestID)
 
-	waitCtx, cancel := context.WithTimeout(ctx, m.cfg.CallbackWait)
+	waitCtx, cancel := context.WithTimeout(ctx, m.cur().CallbackWait)
 	defer cancel()
 	var outcome protocol.CallbackOutcome
 	recvErr := protocol.Recv(waitCtx, st, &outcome)
@@ -138,8 +138,9 @@ func (m *Manager) requestCallback(ctx context.Context) error {
 	}
 	switch {
 	case installed:
+		registrar := m.cur().Registrar
 		if err := m.update(func(s *State) {
-			s.Method, s.Name, s.Registrar = MethodCallback, m.cfg.Name, m.cfg.Registrar
+			s.Method, s.Name, s.Registrar = MethodCallback, m.cfg.Name, registrar
 			s.clearRegistration()
 			s.clearRequest()
 		}); err != nil {
@@ -148,7 +149,7 @@ func (m *Manager) requestCallback(ctx context.Context) error {
 			m.log.Warn("ce: recording the callback registration", "err", err)
 		}
 		m.log.Info("ce: registered by callback", "name", m.cfg.Name)
-		m.reconfig(ctx)
+		_ = m.reconfig(ctx)
 		m.succeeded()
 		return nil
 	case installErr != nil:
@@ -210,6 +211,10 @@ func (m *Manager) HandleCallback(ctx context.Context, c *cedarserver.Conn) error
 			Error: *protocol.Err(protocol.ErrInternal, "%v", err)})
 		return err
 	}
+	// The request may have given up waiting for the outcome by now, in which
+	// case nobody else reconfigures for this token: wake the run loop, whose
+	// next step reconfigures for any token installed since the last one.
+	m.wakeUp()
 	return protocol.Send(ctx, c.Stream, &protocol.Ack{Status: protocol.StatusOK})
 }
 

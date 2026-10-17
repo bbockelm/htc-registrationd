@@ -1,6 +1,7 @@
 package cedarx
 
 import (
+	"sync/atomic"
 	"testing"
 
 	"github.com/bbockelm/cedar/security"
@@ -16,9 +17,7 @@ func TestSSLTrust(t *testing.T) {
 		"AUTH_SSL_SERVER_USE_DEFAULT_CAS": "false",
 	}
 	var sc security.SecurityConfig
-	if err := SSLTrust(cfg, "CLIENT", &sc); err != nil {
-		t.Fatal(err)
-	}
+	SSLTrust(cfg, "CLIENT", &sc)
 	if sc.CAFile != "/etc/a.pem,/etc/b.pem" || sc.CADir != "/etc/grid-security/certificates" {
 		t.Fatalf("CAFile %q CADir %q", sc.CAFile, sc.CADir)
 	}
@@ -28,15 +27,15 @@ func TestSSLTrust(t *testing.T) {
 	}
 
 	sc = security.SecurityConfig{CAFile: "/stale.pem"}
-	if err := SSLTrust(cfg, "SERVER", &sc); err != nil {
-		t.Fatal(err)
-	}
+	SSLTrust(cfg, "SERVER", &sc)
 	if sc.CAFile != "" || sc.CADir != "" || sc.UseDefaultCAs == nil || *sc.UseDefaultCAs {
 		t.Fatalf("server trust: CAFile %q CADir %q UseDefaultCAs %v", sc.CAFile, sc.CADir, sc.UseDefaultCAs)
 	}
 
-	if err := SSLTrust(knobs.Map{"AUTH_SSL_CLIENT_USE_DEFAULT_CAS": "maybe"}, "CLIENT", &sc); err == nil {
-		t.Fatal("an unparseable USE_DEFAULT_CAS was accepted")
+	// An invalid value keeps the default, as in HTCondor.
+	SSLTrust(knobs.Map{"AUTH_SSL_CLIENT_USE_DEFAULT_CAS": "maybe"}, "CLIENT", &sc)
+	if sc.UseDefaultCAs == nil || !*sc.UseDefaultCAs {
+		t.Fatalf("an invalid USE_DEFAULT_CAS: UseDefaultCAs %v, want the default true", sc.UseDefaultCAs)
 	}
 }
 
@@ -49,19 +48,27 @@ func TestServerSSLTrust(t *testing.T) {
 		return nil
 	}
 	HardenCommands(srv, 2)
-	if err := ServerSSLTrust(knobs.Map{"AUTH_SSL_SERVER_CAFILE": "/server.pem"}, srv); err != nil {
-		t.Fatal(err)
-	}
+	var cur atomic.Pointer[knobs.Map]
+	cur.Store(&knobs.Map{"AUTH_SSL_SERVER_CAFILE": "/server.pem"})
+	ServerSSLTrust(func() knobs.Getter { return *cur.Load() }, srv)
 	if srv.SecurityConfig.CAFile != "/server.pem" {
 		t.Fatalf("base CAFile %q", srv.SecurityConfig.CAFile)
 	}
-	for _, cmd := range []int{1, 2} {
+	for _, cmd := range []int{1, 2, 3} {
 		sc := srv.SecurityConfigForCommand(cmd)
 		if sc == nil || sc.CAFile != "/server.pem" || sc.UseDefaultCAs == nil || !*sc.UseDefaultCAs {
 			t.Fatalf("command %d: %+v", cmd, sc)
 		}
 	}
-	if sc := srv.SecurityConfigForCommand(3); sc != nil {
-		t.Fatalf("command 3 gained a config: %+v", sc)
+	// A reconfig is seen by the next handshake.
+	cur.Store(&knobs.Map{"AUTH_SSL_SERVER_CAFILE": "/new.pem", "AUTH_SSL_SERVER_USE_DEFAULT_CAS": "false"})
+	for _, cmd := range []int{1, 2, 3} {
+		sc := srv.SecurityConfigForCommand(cmd)
+		if sc.CAFile != "/new.pem" || *sc.UseDefaultCAs {
+			t.Fatalf("after reconfig, command %d: %+v", cmd, sc)
+		}
+	}
+	if sc := srv.SecurityConfigForCommand(2); len(sc.AuthMethods) != 1 || sc.AuthMethods[0] != security.AuthSSL {
+		t.Fatalf("hardening lost: %+v", sc.AuthMethods)
 	}
 }

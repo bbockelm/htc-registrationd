@@ -4,9 +4,12 @@ package knobs
 
 import (
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/PelicanPlatform/classad/classad"
 )
 
 // Getter is the read side of golang-htcondor's *config.Config.
@@ -30,20 +33,67 @@ func String(cfg Getter, key, def string) string {
 	return def
 }
 
-// Bool returns key as a boolean (true/false/yes/no/1/0, case-insensitive), or
-// def when unset. An unparseable value is an error.
-func Bool(cfg Getter, key string, def bool) (bool, error) {
+// Bool returns key as a boolean the way HTCondor's param_boolean reads one,
+// or def when unset. An invalid value is logged as an error (HTCondor may
+// treat it as fatal) and does not stop the daemon.
+//
+// It ports param_boolean / string_is_boolean_param (condor_config.cpp).
+// golang-htcondor's config.StringIsBooleanParam and (*Config).GetBool are the
+// same port; once the golang-htcondor this module depends on has them, this
+// function can call those instead.
+func Bool(cfg Getter, key string, def bool) bool {
 	v := String(cfg, key, "")
 	if v == "" {
-		return def, nil
+		return def
 	}
-	switch strings.ToLower(v) {
-	case "true", "yes", "1", "t", "y", "on":
-		return true, nil
-	case "false", "no", "0", "f", "n", "off":
-		return false, nil
+	result, valid := StringIsBooleanParam(v, def)
+	if !valid {
+		slog.Error(fmt.Sprintf("%s in the configuration is not a valid boolean (%q); please set it to True or False",
+			key, v), "using", result)
 	}
-	return def, fmt.Errorf("%s: %q is not a boolean", key, v)
+	return result
+}
+
+// StringIsBooleanParam is HTCondor's string_is_boolean_param. A value is
+// true, false, 1 or 0 (case-insensitive) followed only by white space, or else
+// an old-syntax ClassAd expression that evaluates to a boolean or a number
+// (non-zero is true). It returns the value and whether s was valid. When s is
+// not valid, the result is def, except that a valid literal prefix
+// ("truex", "0 0") yields that literal, as in HTCondor.
+func StringIsBooleanParam(s string, def bool) (result bool, valid bool) {
+	result = def
+	rest := ""
+	lower := strings.ToLower(s)
+	switch {
+	case strings.HasPrefix(lower, "true"):
+		result, rest, valid = true, s[4:], true
+	case strings.HasPrefix(lower, "1"):
+		result, rest, valid = true, s[1:], true
+	case strings.HasPrefix(lower, "false"):
+		result, rest, valid = false, s[5:], true
+	case strings.HasPrefix(lower, "0"):
+		result, rest, valid = false, s[1:], true
+	}
+	if valid && strings.TrimLeft(rest, " \t\n\r\v\f") == "" {
+		return result, true
+	}
+	expr, err := classad.ParseExprOld(s)
+	if err != nil {
+		return result, false
+	}
+	val := expr.Eval(classad.New())
+	switch {
+	case val.IsBool():
+		b, _ := val.BoolValue()
+		return b, true
+	case val.IsInteger():
+		n, _ := val.IntValue()
+		return n != 0, true
+	case val.IsReal():
+		f, _ := val.RealValue()
+		return f != 0, true
+	}
+	return result, false
 }
 
 // Int returns key as an integer, or def when unset.

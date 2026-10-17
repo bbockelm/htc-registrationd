@@ -46,8 +46,19 @@ func scramble(in []byte) []byte {
 	return out
 }
 
-// KeyFile is the path of the signing key: KeyID in KeyDir.
+// PoolKeyID is the key id HTCondor reads from SEC_TOKEN_POOL_SIGNING_KEY_FILE
+// instead of SEC_PASSWORD_DIRECTORY.
+const PoolKeyID = "POOL"
+
+// KeyFile is the path of the signing key: PoolKeyFile for the POOL key, as
+// HTCondor's getTokenSigningKeyPath has it, else KeyID in KeyDir.
 func (m *Minter) KeyFile() (string, error) {
+	if m.KeyID == PoolKeyID {
+		if m.PoolKeyFile == "" {
+			return "", fmt.Errorf("mint: the POOL signing key needs SEC_TOKEN_POOL_SIGNING_KEY_FILE")
+		}
+		return m.PoolKeyFile, nil
+	}
 	if m.KeyID == "" || strings.ContainsAny(m.KeyID, `/\`) || strings.Contains(m.KeyID, "..") {
 		return "", fmt.Errorf("mint: invalid signing key name %q", m.KeyID)
 	}
@@ -63,14 +74,15 @@ func (m *Minter) KeyFile() (string, error) {
 // write_binary_password_file writes it, so the collector reading the same
 // file accepts the tokens minted with it.
 //
-// With KeyDir unset (no SEC_PASSWORD_DIRECTORY) there is nowhere to create
-// the key and nothing is done, as in HTCondor.
+// With KeyDir unset (no SEC_PASSWORD_DIRECTORY), or for the POOL key with
+// PoolKeyFile unset, there is nowhere to create the key and nothing is done,
+// as in HTCondor.
 //
 // When the write fails after the file was created, the file is truncated to
 // empty rather than left holding part of a key; the minter refuses an empty
 // key, and the file must be removed for a new one to be created.
 func (m *Minter) CreateKeyIfMissing() (bool, error) {
-	if m.KeyDir == "" {
+	if (m.KeyID == PoolKeyID && m.PoolKeyFile == "") || (m.KeyID != PoolKeyID && m.KeyDir == "") {
 		return false, nil
 	}
 	path, err := m.KeyFile()

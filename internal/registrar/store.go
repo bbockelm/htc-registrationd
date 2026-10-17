@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"net/url"
 	"strings"
 	"time"
@@ -118,6 +119,7 @@ CREATE TABLE IF NOT EXISTS requests (
 	name             TEXT NOT NULL,
 	method           TEXT NOT NULL,
 	source_ip        TEXT NOT NULL DEFAULT '',
+	source_net       TEXT NOT NULL DEFAULT '',
 	callback_address TEXT NOT NULL DEFAULT '',
 	ce_version       TEXT NOT NULL DEFAULT '',
 	user_code        TEXT UNIQUE,
@@ -147,6 +149,8 @@ CREATE TABLE IF NOT EXISTS registrations (
 	current_hash    TEXT NOT NULL DEFAULT '',
 	pending_hash    TEXT NOT NULL DEFAULT '',
 	retired_hashes  TEXT NOT NULL DEFAULT '[]',
+	replaced_hashes TEXT NOT NULL DEFAULT '[]',
+	reissues        INTEGER NOT NULL DEFAULT 0,
 	revoked_at      INTEGER NOT NULL DEFAULT 0,
 	revoked_by      TEXT NOT NULL DEFAULT '',
 	revoke_reason   TEXT NOT NULL DEFAULT ''
@@ -163,7 +167,69 @@ CREATE TABLE IF NOT EXISTS issued_tokens (
 	expires_at      INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS issued_tokens_registration ON issued_tokens(registration_id);
+CREATE INDEX IF NOT EXISTS issued_tokens_expires ON issued_tokens(expires_at);
 `
+
+// addedColumns are columns added after the first release, created on an
+// older database by migrate.
+var addedColumns = []struct{ table, column, decl string }{
+	{"requests", "source_net", "TEXT NOT NULL DEFAULT ''"},
+	{"registrations", "replaced_hashes", "TEXT NOT NULL DEFAULT '[]'"},
+	{"registrations", "reissues", "INTEGER NOT NULL DEFAULT 0"},
+}
+
+// migrate brings an older database up to the current schema: it adds missing
+// columns, lower-cases names (names compare without regard to case, and
+// every name is lower-cased at intake), and fills in source_net.
+func migrate(ctx context.Context, db *sql.DB) error {
+	for _, c := range addedColumns {
+		var n int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`,
+			c.table, c.column).Scan(&n); err != nil {
+			return fmt.Errorf("store: inspecting %s: %w", c.table, err)
+		}
+		if n == 0 {
+			if _, err := db.ExecContext(ctx, `ALTER TABLE `+c.table+` ADD COLUMN `+c.column+` `+c.decl); err != nil {
+				return fmt.Errorf("store: adding %s.%s: %w", c.table, c.column, err)
+			}
+		}
+	}
+	for _, q := range []string{
+		`UPDATE requests SET name = lower(name) WHERE name != lower(name)`,
+		`UPDATE registrations SET name = lower(name) WHERE name != lower(name)`,
+		`UPDATE issued_tokens SET name = lower(name) WHERE name != lower(name)`,
+	} {
+		if _, err := db.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("store: lower-casing names: %w", err)
+		}
+	}
+	rows, err := db.QueryContext(ctx, `SELECT id, source_ip FROM requests WHERE source_net = '' AND source_ip != ''`)
+	if err != nil {
+		return fmt.Errorf("store: reading request sources: %w", err)
+	}
+	type src struct {
+		id int64
+		ip string
+	}
+	var fix []src
+	for rows.Next() {
+		var s src
+		if err := rows.Scan(&s.id, &s.ip); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		fix = append(fix, s)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, s := range fix {
+		if _, err := db.ExecContext(ctx, `UPDATE requests SET source_net = ? WHERE id = ?`, SourceNet(s.ip), s.id); err != nil {
+			return fmt.Errorf("store: setting source_net: %w", err)
+		}
+	}
+	return nil
+}
 
 // OpenStore opens (creating if needed) the database at path.
 func OpenStore(path string, now func() time.Time) (*Store, error) {
@@ -183,6 +249,10 @@ func OpenStore(path string, now func() time.Time) (*Store, error) {
 	if _, err := db.ExecContext(context.Background(), schema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("store: creating schema in %s: %w", path, err)
+	}
+	if err := migrate(context.Background(), db); err != nil {
+		_ = db.Close()
+		return nil, err
 	}
 	return &Store{db: db, now: now}, nil
 }
@@ -239,49 +309,97 @@ type NewRequest struct {
 	Status          string
 	TTL             time.Duration
 	PollInterval    time.Duration
+	// MaxPerSource and MaxTotal, when positive, cap live (pending or
+	// callback-pending, unexpired) requests from the source's network
+	// (SourceNet) and in total. The count and the insert are one transaction.
+	MaxPerSource int
+	MaxTotal     int
 }
 
 // ErrUserCodeTaken reports a user-code collision; the caller draws another.
 var ErrUserCodeTaken = errors.New("user code already in use")
 
-// CreateRequest records a new request and returns its number. A CEVersion
-// that is not a plain version string is recorded as empty.
+// CapError reports a request refused by the pending-request caps.
+type CapError struct {
+	PerSource bool   // the per-network cap, not the global one
+	Net       string // the source network counted
+}
+
+func (e *CapError) Error() string {
+	if e.PerSource {
+		return "too many pending requests from " + e.Net
+	}
+	return "too many pending requests"
+}
+
+// SourceNet is the network a source address is counted under for the
+// per-source cap: an IPv6 address's /64 (one site or one host can hold a
+// whole /64) and an IPv4 address itself.
+func SourceNet(ip string) string {
+	a, err := netip.ParseAddr(ip)
+	if err != nil {
+		return ip
+	}
+	a = a.Unmap().WithZone("")
+	if a.Is4() {
+		return a.String()
+	}
+	p, err := a.Prefix(64)
+	if err != nil {
+		return a.String()
+	}
+	return p.String()
+}
+
+// CreateRequest records a new request and returns its number. It refuses
+// with a *CapError when the request would exceed r's caps. A CEVersion that
+// is not a plain version string is recorded as empty.
 func (s *Store) CreateRequest(ctx context.Context, r NewRequest) (int64, error) {
 	if !validCEVersion(r.CEVersion) {
 		r.CEVersion = ""
 	}
-	now := s.now()
-	var code any
-	if r.UserCode != "" {
-		code = r.UserCode
-	}
-	res, err := s.db.ExecContext(ctx, `INSERT INTO requests
-		(request_id_hash, nonce_hash, name, method, source_ip, callback_address, ce_version,
-		 user_code, status, created_at, expires_at, poll_interval)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-		r.RequestIDHash, r.NonceHash, r.Name, r.Method, r.SourceIP, r.CallbackAddress, r.CEVersion,
-		code, r.Status, now.Unix(), now.Add(r.TTL).Unix(), int64(r.PollInterval/time.Second))
-	if err != nil {
-		if r.UserCode != "" && strings.Contains(err.Error(), "UNIQUE") && strings.Contains(err.Error(), "user_code") {
-			return 0, ErrUserCodeTaken
+	var number int64
+	err := s.tx(ctx, func(t *sql.Tx) error {
+		now := s.now()
+		srcNet := SourceNet(r.SourceIP)
+		if r.MaxPerSource > 0 || r.MaxTotal > 0 {
+			var perSource, total int
+			if err := t.QueryRowContext(ctx, `SELECT
+				COALESCE(SUM(CASE WHEN source_net = ? THEN 1 ELSE 0 END), 0), COUNT(*)
+				FROM requests WHERE status IN (?, ?) AND expires_at > ?`,
+				srcNet, ReqPending, ReqCallbackPending, now.Unix()).Scan(&perSource, &total); err != nil {
+				return fmt.Errorf("store: counting pending requests: %w", err)
+			}
+			if r.MaxPerSource > 0 && perSource >= r.MaxPerSource {
+				return &CapError{PerSource: true, Net: srcNet}
+			}
+			if r.MaxTotal > 0 && total >= r.MaxTotal {
+				return &CapError{}
+			}
 		}
-		return 0, fmt.Errorf("store: inserting request: %w", err)
-	}
-	return res.LastInsertId()
-}
-
-// CountPending returns the live (pending or callback-pending, unexpired)
-// requests from sourceIP and in total.
-func (s *Store) CountPending(ctx context.Context, sourceIP string) (perIP, total int, err error) {
-	now := s.now().Unix()
-	err = s.db.QueryRowContext(ctx, `SELECT
-		COALESCE(SUM(CASE WHEN source_ip = ? THEN 1 ELSE 0 END), 0), COUNT(*)
-		FROM requests WHERE status IN (?, ?) AND expires_at > ?`,
-		sourceIP, ReqPending, ReqCallbackPending, now).Scan(&perIP, &total)
+		var code any
+		if r.UserCode != "" {
+			code = r.UserCode
+		}
+		res, err := t.ExecContext(ctx, `INSERT INTO requests
+			(request_id_hash, nonce_hash, name, method, source_ip, source_net, callback_address, ce_version,
+			 user_code, status, created_at, expires_at, poll_interval)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			r.RequestIDHash, r.NonceHash, NormalizeName(r.Name), r.Method, r.SourceIP, srcNet, r.CallbackAddress,
+			r.CEVersion, code, r.Status, now.Unix(), now.Add(r.TTL).Unix(), int64(r.PollInterval/time.Second))
+		if err != nil {
+			if r.UserCode != "" && strings.Contains(err.Error(), "UNIQUE") && strings.Contains(err.Error(), "user_code") {
+				return ErrUserCodeTaken
+			}
+			return fmt.Errorf("store: inserting request: %w", err)
+		}
+		number, err = res.LastInsertId()
+		return err
+	})
 	if err != nil {
-		return 0, 0, fmt.Errorf("store: counting pending requests: %w", err)
+		return 0, err
 	}
-	return perIP, total, nil
+	return number, nil
 }
 
 const requestCols = `id, name, method, source_ip, callback_address, ce_version, COALESCE(user_code, ''),
@@ -339,7 +457,49 @@ var ErrNotPending = errors.New("request is not pending approval")
 
 // Decide approves or denies a pending, unexpired approval-mode request.
 func (s *Store) Decide(ctx context.Context, n int64, approve bool, by Identity, reason string) error {
-	return s.tx(ctx, func(t *sql.Tx) error {
+	_, err := s.DecideChecked(ctx, n, approve, by, reason, DecideOptions{})
+	return err
+}
+
+// DecideOptions are the checks an approval from the command line makes.
+type DecideOptions struct {
+	// ExpectName, when set, is the name the approver expects the request to
+	// carry; a request for another name is refused with a *NameMismatchError.
+	ExpectName string
+	// RefuseActive refuses (with an *ActiveRegistrationError) to approve a
+	// request whose name already has an active registration, unless Replace
+	// is set; Replace revokes the name's active approval-mode registrations
+	// in the same transaction.
+	RefuseActive bool
+	Replace      bool
+}
+
+// NameMismatchError reports an approval naming a different CE than the
+// request carries.
+type NameMismatchError struct{ Request, Expected string }
+
+func (e *NameMismatchError) Error() string {
+	return fmt.Sprintf("the request is for %s, not %s", e.Request, e.Expected)
+}
+
+// ActiveRegistrationError reports an approval for a name that already has an
+// active registration.
+type ActiveRegistrationError struct {
+	Name string
+	IDs  []string
+}
+
+func (e *ActiveRegistrationError) Error() string {
+	return fmt.Sprintf("%s already has an active registration (%s); approve with --replace to replace it",
+		e.Name, strings.Join(e.IDs, ", "))
+}
+
+// DecideChecked is Decide with opts' checks. It returns the registrations
+// revoked by Replace.
+func (s *Store) DecideChecked(ctx context.Context, n int64, approve bool, by Identity, reason string,
+	opts DecideOptions) ([]*RegistrationRecord, error) {
+	var replaced []*RegistrationRecord
+	err := s.tx(ctx, func(t *sql.Tx) error {
 		r, err := scanRequest(t.QueryRowContext(ctx, `SELECT `+requestCols+` FROM requests WHERE id = ?`, n))
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
@@ -352,8 +512,33 @@ func (s *Store) Decide(ctx context.Context, n int64, approve bool, by Identity, 
 			return fmt.Errorf("%w (status %s)", ErrNotPending, r.Status)
 		}
 		if !now.Before(r.ExpiresAt) {
-			_, _ = t.ExecContext(ctx, `UPDATE requests SET status = ? WHERE id = ?`, ReqExpired, n)
 			return fmt.Errorf("%w (expired)", ErrNotPending)
+		}
+		if approve && opts.ExpectName != "" && NormalizeName(opts.ExpectName) != r.Name {
+			return &NameMismatchError{Request: r.Name, Expected: NormalizeName(opts.ExpectName)}
+		}
+		if approve && opts.RefuseActive {
+			active, err := activeRegistrations(ctx, t, r.Name)
+			if err != nil {
+				return err
+			}
+			if len(active) > 0 && !opts.Replace {
+				e := &ActiveRegistrationError{Name: r.Name}
+				for _, a := range active {
+					e.IDs = append(e.IDs, a.Method+" "+a.ID)
+				}
+				return e
+			}
+			for _, a := range active {
+				if a.Method != protocol.MethodApproval {
+					continue // revoking a callback registration would bar the name from callback
+				}
+				if err := revokeTx(ctx, t, a.ID, now, by.String(), fmt.Sprintf("replaced by request %d", n)); err != nil {
+					return err
+				}
+				a.Status = RegRevoked
+				replaced = append(replaced, a)
+			}
 		}
 		status := ReqDenied
 		if approve {
@@ -363,6 +548,35 @@ func (s *Store) Decide(ctx context.Context, n int64, approve bool, by Identity, 
 			WHERE id = ?`, status, now.Unix(), by.String(), reason, n)
 		return err
 	})
+	if err != nil {
+		return nil, err
+	}
+	return replaced, nil
+}
+
+func activeRegistrations(ctx context.Context, t *sql.Tx, name string) ([]*RegistrationRecord, error) {
+	rows, err := t.QueryContext(ctx, `SELECT `+registrationCols+` FROM registrations WHERE name = ? AND status IN (?, ?)`,
+		NormalizeName(name), RegActive, RegPendingAck)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []*RegistrationRecord
+	for rows.Next() {
+		r, err := scanRegistration(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func revokeTx(ctx context.Context, t *sql.Tx, regID string, now time.Time, by, reason string) error {
+	_, err := t.ExecContext(ctx, `UPDATE registrations SET status = ?, revoked_at = ?, revoked_by = ?,
+		revoke_reason = ?, updated_at = ? WHERE registration_id = ?`,
+		RegRevoked, now.Unix(), by, reason, now.Unix(), regID)
+	return err
 }
 
 // MintFunc mints a token for a CE name.
@@ -401,6 +615,12 @@ type PollOptions struct {
 // unclaimed request yields a freshly minted token and a new first secret,
 // which replaces the registration's pending secret; once the CE has proven a
 // secret with REG_RENEW the request is claimed and polling it yields nothing.
+//
+// Polling an approved request is throttled like polling a pending one: a poll
+// sooner than the request's interval is told to slow down. Each re-mint for a
+// request that already minted (an honest CE re-polls only when it lost the
+// reply) also grows the interval, so a holder of the request id and nonce
+// cannot mint a token per interval for long.
 func (s *Store) Poll(ctx context.Context, requestID, nonce string, opts PollOptions, mintFn MintFunc) (*PollResult, error) {
 	var out *PollResult
 	err := s.tx(ctx, func(t *sql.Tx) error {
@@ -420,7 +640,8 @@ func (s *Store) Poll(ctx context.Context, requestID, nonce string, opts PollOpti
 
 		// Rate: a poll sooner than the interval is told to slow down, and the
 		// interval grows (RFC 8628 §3.5).
-		if !r.LastPollAt.IsZero() && now.Sub(r.LastPollAt) < r.PollInterval && r.Status == ReqPending {
+		if !r.LastPollAt.IsZero() && now.Sub(r.LastPollAt) < r.PollInterval &&
+			(r.Status == ReqPending || r.Status == ReqApproved) {
 			out.Interval = r.PollInterval + opts.SlowDownStep
 			out.Status = protocol.StatusSlowDown
 			_, err := t.ExecContext(ctx, `UPDATE requests SET poll_interval = ?, last_poll_at = ? WHERE id = ?`,
@@ -455,70 +676,7 @@ func (s *Store) Poll(ctx context.Context, requestID, nonce string, opts PollOpti
 			return nil
 		}
 
-		// Approved. Unclaimed requests are kept for UnclaimedTTL.
-		if opts.UnclaimedTTL > 0 && now.Sub(r.DecidedAt) > opts.UnclaimedTTL {
-			out.Status = protocol.StatusExpired
-			_, err := t.ExecContext(ctx, `UPDATE requests SET status = ? WHERE id = ?`, ReqExpired, r.Number)
-			return err
-		}
-		regID := r.RegistrationID
-		if regID != "" {
-			reg, err := scanRegistration(t.QueryRowContext(ctx, `SELECT `+registrationCols+` FROM registrations
-				WHERE registration_id = ?`, regID))
-			if err != nil {
-				return fmt.Errorf("store: registration %s of request %d: %w", regID, r.Number, err)
-			}
-			if reg.Status != RegActive {
-				out.Status = protocol.StatusRevoked
-				return nil
-			}
-			if reg.secrets.Current != "" {
-				// The CE already proved a secret; re-polling must not mint.
-				out.Status = protocol.StatusClaimed
-				_, err := t.ExecContext(ctx, `UPDATE requests SET status = ? WHERE id = ?`, ReqClaimed, r.Number)
-				return err
-			}
-		}
-
-		tok, err := mintFn(r.Name)
-		if err != nil {
-			return err
-		}
-		first, err := secret.NewSecret()
-		if err != nil {
-			return err
-		}
-		if regID == "" {
-			if regID, err = secret.NewID(); err != nil {
-				return err
-			}
-			_, err = t.ExecContext(ctx, `INSERT INTO registrations
-				(registration_id, name, method, status, approver, request_number, source_ip,
-				 created_at, updated_at, last_issued_at, token_expiry, pending_hash)
-				VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-				regID, r.Name, protocol.MethodApproval, RegActive, r.DecidedBy, r.Number, r.SourceIP,
-				now.Unix(), now.Unix(), tok.IssuedAt.Unix(), tok.Expiry.Unix(), secret.Hash(first))
-			if err != nil {
-				return fmt.Errorf("store: creating registration: %w", err)
-			}
-			if _, err := t.ExecContext(ctx, `UPDATE requests SET registration_id = ? WHERE id = ?`, regID, r.Number); err != nil {
-				return err
-			}
-		} else {
-			// Re-poll before the first REG_RENEW: re-mint and replace pending.
-			_, err = t.ExecContext(ctx, `UPDATE registrations SET pending_hash = ?, updated_at = ?,
-				last_issued_at = ?, token_expiry = ? WHERE registration_id = ?`,
-				secret.Hash(first), now.Unix(), tok.IssuedAt.Unix(), tok.Expiry.Unix(), regID)
-			if err != nil {
-				return err
-			}
-		}
-		if err := insertIssued(ctx, t, regID, r.Name, protocol.MethodApproval, "poll", tok); err != nil {
-			return err
-		}
-		out.Status = protocol.StatusApproved
-		out.RegistrationID, out.Token, out.RefreshSecret = regID, tok, first
-		return nil
+		return s.pollApproved(ctx, t, r, now, opts, mintFn, out)
 	})
 	if err != nil {
 		return nil, err
@@ -526,21 +684,108 @@ func (s *Store) Poll(ctx context.Context, requestID, nonce string, opts PollOpti
 	return out, nil
 }
 
+// pollApproved answers a poll of an approved request: it mints the first
+// token, or re-mints one for a re-poll before the first renewal.
+func (s *Store) pollApproved(ctx context.Context, t *sql.Tx, r *RequestRecord, now time.Time, opts PollOptions,
+	mintFn MintFunc, out *PollResult) error {
+	// Approved. Unclaimed requests are kept for UnclaimedTTL.
+	if opts.UnclaimedTTL > 0 && now.Sub(r.DecidedAt) > opts.UnclaimedTTL {
+		out.Status = protocol.StatusExpired
+		_, err := t.ExecContext(ctx, `UPDATE requests SET status = ? WHERE id = ?`, ReqExpired, r.Number)
+		return err
+	}
+	regID := r.RegistrationID
+	if regID != "" {
+		reg, err := scanRegistration(t.QueryRowContext(ctx, `SELECT `+registrationCols+` FROM registrations
+			WHERE registration_id = ?`, regID))
+		if err != nil {
+			return fmt.Errorf("store: registration %s of request %d: %w", regID, r.Number, err)
+		}
+		switch reg.Status {
+		case RegActive:
+		case RegRevoked:
+			out.Status = protocol.StatusRevoked
+			return nil
+		default:
+			out.Status = protocol.StatusExpired
+			return nil
+		}
+		if reg.secrets.Current != "" {
+			// The CE already proved a secret; re-polling must not mint.
+			out.Status = protocol.StatusClaimed
+			_, err := t.ExecContext(ctx, `UPDATE requests SET status = ? WHERE id = ?`, ReqClaimed, r.Number)
+			return err
+		}
+		// A re-mint: grow the interval the next one must wait.
+		out.Interval = r.PollInterval + opts.SlowDownStep
+		if _, err := t.ExecContext(ctx, `UPDATE requests SET poll_interval = ? WHERE id = ?`,
+			int64(out.Interval/time.Second), r.Number); err != nil {
+			return err
+		}
+	}
+
+	tok, err := mintFn(r.Name)
+	if err != nil {
+		return err
+	}
+	first, err := secret.NewSecret()
+	if err != nil {
+		return err
+	}
+	if regID == "" {
+		if regID, err = secret.NewID(); err != nil {
+			return err
+		}
+		_, err = t.ExecContext(ctx, `INSERT INTO registrations
+			(registration_id, name, method, status, approver, request_number, source_ip,
+			 created_at, updated_at, last_issued_at, token_expiry, pending_hash)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+			regID, r.Name, protocol.MethodApproval, RegActive, r.DecidedBy, r.Number, r.SourceIP,
+			now.Unix(), now.Unix(), now.Unix(), tok.Expiry.Unix(), secret.Hash(first))
+		if err != nil {
+			return fmt.Errorf("store: creating registration: %w", err)
+		}
+		if _, err := t.ExecContext(ctx, `UPDATE requests SET registration_id = ? WHERE id = ?`, regID, r.Number); err != nil {
+			return err
+		}
+	} else {
+		// Re-poll before the first REG_RENEW: re-mint and replace pending.
+		// The replaced first secret is not recorded as superseded: only
+		// the holder of the request id and nonce could have received it,
+		// and presenting it is a plain reject.
+		_, err = t.ExecContext(ctx, `UPDATE registrations SET pending_hash = ?, updated_at = ?,
+			last_issued_at = ?, token_expiry = ? WHERE registration_id = ?`,
+			secret.Hash(first), now.Unix(), now.Unix(), tok.Expiry.Unix(), regID)
+		if err != nil {
+			return err
+		}
+	}
+	if err := insertIssued(ctx, t, regID, r.Name, protocol.MethodApproval, "poll", tok); err != nil {
+		return err
+	}
+	out.Status = protocol.StatusApproved
+	out.RegistrationID, out.Token, out.RefreshSecret = regID, tok, first
+	return nil
+}
+
 const registrationCols = `registration_id, name, method, status, approver, request_number, source_ip,
 	created_at, updated_at, last_issued_at, token_expiry, current_hash, pending_hash, retired_hashes,
-	revoked_at, revoked_by, revoke_reason`
+	replaced_hashes, reissues, revoked_at, revoked_by, revoke_reason`
 
 func scanRegistration(row scanner) (*RegistrationRecord, error) {
 	var r RegistrationRecord
 	var created, updated, issued, expiry, revoked int64
-	var retired string
+	var retired, replaced string
 	if err := row.Scan(&r.ID, &r.Name, &r.Method, &r.Status, &r.Approver, &r.RequestNumber, &r.SourceIP,
 		&created, &updated, &issued, &expiry, &r.secrets.Current, &r.secrets.Pending, &retired,
-		&revoked, &r.RevokedBy, &r.RevokeReason); err != nil {
+		&replaced, &r.secrets.Reissues, &revoked, &r.RevokedBy, &r.RevokeReason); err != nil {
 		return nil, err
 	}
 	if err := json.Unmarshal([]byte(retired), &r.secrets.Retired); err != nil {
 		return nil, fmt.Errorf("store: registration %s: retired hashes: %w", r.ID, err)
+	}
+	if err := json.Unmarshal([]byte(replaced), &r.secrets.Replaced); err != nil {
+		return nil, fmt.Errorf("store: registration %s: replaced hashes: %w", r.ID, err)
 	}
 	r.CreatedAt, r.UpdatedAt = fromUnix(created), fromUnix(updated)
 	r.LastIssuedAt, r.TokenExpiry, r.RevokedAt = fromUnix(issued), fromUnix(expiry), fromUnix(revoked)
@@ -566,6 +811,16 @@ type RenewOptions struct {
 	// MaxAge, when positive, caps a registration's age
 	// (HTC_REGISTRATIOND_MAX_REGISTRATION_AGE).
 	MaxAge time.Duration
+	// IdleLifetime, when positive, is how long a refresh secret stays usable
+	// after the registration's last successful issuance
+	// (HTC_REGISTRATIOND_REFRESH_IDLE_LIFETIME). It is independent of the
+	// token's lifetime: an expired token is renewed like any other.
+	IdleLifetime time.Duration
+	// MaxReissues, when positive, is how many consecutive reissues (the
+	// current secret presented, the pending one never proven) a
+	// registration may have; one more revokes it
+	// (HTC_REGISTRATIOND_MAX_REISSUES).
+	MaxReissues int
 	// Recheck, when set, is asked whether the original approver may still
 	// approve the name (HTC_REGISTRATIOND_RECHECK_APPROVER).
 	Recheck func(ctx context.Context, approver Identity, name string) (bool, error)
@@ -587,10 +842,34 @@ type RenewResult struct {
 	RefreshSecret string // the new pending secret
 }
 
+// expiredBy returns why reg has expired at now under opts' age limits, or "".
+func expiredBy(reg *RegistrationRecord, now time.Time, opts RenewOptions) string {
+	if opts.MaxAge > 0 && now.Sub(reg.CreatedAt) > opts.MaxAge {
+		return "registration exceeded its maximum age"
+	}
+	lastUse := reg.LastIssuedAt
+	if lastUse.IsZero() {
+		lastUse = reg.CreatedAt
+	}
+	if opts.IdleLifetime > 0 && now.Sub(lastUse) > opts.IdleLifetime {
+		return "the refresh secret was not used for too long"
+	}
+	return ""
+}
+
+func marshalHashes(list []string) (string, error) {
+	if list == nil {
+		return "[]", nil
+	}
+	b, err := json.Marshal(list)
+	return string(b), err
+}
+
 // Renew answers REG_RENEW: it classifies the presented
-// secret against the registration's current / pending / retired hashes and
+// secret against the registration's current / pending / superseded hashes and
 // applies the result in one transaction, which commits before the caller
-// replies. A retired secret revokes the registration.
+// replies. A superseded secret, or one reissue too many, revokes the
+// registration.
 func (s *Store) Renew(ctx context.Context, regID, presented string, opts RenewOptions, mintFn MintFunc) (*RenewResult, error) {
 	var out *RenewResult
 	var refusal error
@@ -615,32 +894,40 @@ func (s *Store) Renew(ctx context.Context, regID, presented string, opts RenewOp
 			return nil
 		}
 
+		revoke := func(reason, reply string) error {
+			if err := revokeTx(ctx, t, reg.ID, now, "registrar", reason); err != nil {
+				return err
+			}
+			reg.Status, reg.RevokeReason = RegRevoked, reason
+			refusal = &RenewError{Code: protocol.ErrRevoked, Reason: reply}
+			out = &RenewResult{Action: RenewReuse, Registration: reg}
+			return nil
+		}
 		action := Classify(reg.secrets, presented)
 		switch action {
 		case RenewReject:
 			refusal = &RenewError{Code: protocol.ErrUnknown, Reason: "refresh secret does not match"}
 			return nil
 		case RenewReuse:
-			_, err := t.ExecContext(ctx, `UPDATE registrations SET status = ?, revoked_at = ?, revoked_by = ?,
-				revoke_reason = ?, updated_at = ? WHERE registration_id = ?`,
-				RegRevoked, now.Unix(), "registrar", "reuse of a retired refresh secret", now.Unix(), reg.ID)
-			if err != nil {
-				return err
-			}
-			refusal = &RenewError{Code: protocol.ErrRevoked,
-				Reason: "a superseded refresh secret was presented; the registration is revoked"}
-			out = &RenewResult{Action: action, Registration: reg}
-			return nil
+			return revoke("reuse of a superseded refresh secret",
+				"a superseded refresh secret was presented; the registration is revoked")
 		}
 
 		// Policies that refuse without consuming the secret.
-		if opts.MaxAge > 0 && now.Sub(reg.CreatedAt) > opts.MaxAge {
+		if why := expiredBy(reg, now, opts); why != "" {
 			if _, err := t.ExecContext(ctx, `UPDATE registrations SET status = ?, updated_at = ? WHERE registration_id = ?`,
 				RegExpired, now.Unix(), reg.ID); err != nil {
 				return err
 			}
-			refusal = &RenewError{Code: protocol.ErrExpired, Reason: "registration exceeded its maximum age"}
+			refusal = &RenewError{Code: protocol.ErrExpired, Reason: why}
 			return nil
+		}
+		if action == RenewReissue && opts.MaxReissues > 0 && reg.secrets.Reissues >= opts.MaxReissues {
+			err := revoke(fmt.Sprintf("the current refresh secret was presented %d times in a row without the pending one being proven",
+				reg.secrets.Reissues+1),
+				"too many renewals with the current refresh secret; the registration is revoked")
+			out.Action = RenewReissue
+			return err
 		}
 		if opts.Recheck != nil {
 			ok, err := opts.Recheck(ctx, ParseIdentity(reg.Approver), reg.Name)
@@ -663,16 +950,18 @@ func (s *Store) Renew(ctx context.Context, regID, presented string, opts RenewOp
 			return err
 		}
 		st := Apply(reg.secrets, action, secret.Hash(next))
-		retired, err := json.Marshal(st.Retired)
+		retired, err := marshalHashes(st.Retired)
 		if err != nil {
 			return err
 		}
-		if st.Retired == nil {
-			retired = []byte("[]")
+		replaced, err := marshalHashes(st.Replaced)
+		if err != nil {
+			return err
 		}
 		_, err = t.ExecContext(ctx, `UPDATE registrations SET current_hash = ?, pending_hash = ?, retired_hashes = ?,
-			updated_at = ?, last_issued_at = ?, token_expiry = ? WHERE registration_id = ?`,
-			st.Current, st.Pending, string(retired), now.Unix(), tok.IssuedAt.Unix(), tok.Expiry.Unix(), reg.ID)
+			replaced_hashes = ?, reissues = ?, updated_at = ?, last_issued_at = ?, token_expiry = ?
+			WHERE registration_id = ?`,
+			st.Current, st.Pending, retired, replaced, st.Reissues, now.Unix(), now.Unix(), tok.Expiry.Unix(), reg.ID)
 		if err != nil {
 			return fmt.Errorf("store: updating registration %s: %w", reg.ID, err)
 		}
@@ -687,6 +976,7 @@ func (s *Store) Renew(ctx context.Context, regID, presented string, opts RenewOp
 			}
 		}
 		reg.secrets = st
+		reg.LastIssuedAt, reg.TokenExpiry = now, tok.Expiry
 		out = &RenewResult{Action: action, Registration: reg, Token: tok, RefreshSecret: next}
 		return nil
 	})
@@ -707,6 +997,7 @@ func (s *Store) Renew(ctx context.Context, regID, presented string, opts RenewOp
 // to be delivered. It refuses a name whose callback registration is revoked.
 func (s *Store) CallbackRegistration(ctx context.Context, requestNumber int64, name, sourceIP string, tok *mint.Token) (string, error) {
 	var regID string
+	name = NormalizeName(name)
 	err := s.tx(ctx, func(t *sql.Tx) error {
 		now := s.now()
 		reg, err := scanRegistration(t.QueryRowContext(ctx, `SELECT `+registrationCols+` FROM registrations
@@ -755,7 +1046,7 @@ func (s *Store) CallbackAcknowledged(ctx context.Context, requestNumber int64, r
 func (s *Store) NameRevoked(ctx context.Context, name string) (bool, error) {
 	var n int
 	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM registrations WHERE name = ? AND method = ? AND status = ?`,
-		name, protocol.MethodCallback, RegRevoked).Scan(&n)
+		NormalizeName(name), protocol.MethodCallback, RegRevoked).Scan(&n)
 	return n > 0, err
 }
 
@@ -773,7 +1064,7 @@ func (s *Store) Revoke(ctx context.Context, regID, name string, by Identity, rea
 			q += `registration_id = ?`
 		} else {
 			q += `name = ?`
-			arg = name
+			arg = NormalizeName(name)
 		}
 		rows, err := t.QueryContext(ctx, q, RegRevoked, arg)
 		if err != nil {
@@ -790,11 +1081,9 @@ func (s *Store) Revoke(ctx context.Context, regID, name string, by Identity, rea
 		if err := rows.Close(); err != nil {
 			return err
 		}
-		now := s.now().Unix()
+		now := s.now()
 		for _, r := range out {
-			if _, err := t.ExecContext(ctx, `UPDATE registrations SET status = ?, revoked_at = ?, revoked_by = ?,
-				revoke_reason = ?, updated_at = ? WHERE registration_id = ?`,
-				RegRevoked, now, by.String(), reason, now, r.ID); err != nil {
+			if err := revokeTx(ctx, t, r.ID, now, by.String(), reason); err != nil {
 				return err
 			}
 			r.Status = RegRevoked
@@ -853,18 +1142,43 @@ func (s *Store) IssuedTokenCount(ctx context.Context, regID string) (int, error)
 	return n, err
 }
 
-// Maintain expires pending requests past their TTL and deletes finished
-// requests older than retain. Registrations and issued tokens are kept.
-func (s *Store) Maintain(ctx context.Context, retain time.Duration) error {
+// MaintainOptions are Maintain's retention policies.
+type MaintainOptions struct {
+	// Retain is how long finished requests are kept (0: forever).
+	Retain time.Duration
+	// UnclaimedTTL expires approved requests not claimed within it.
+	UnclaimedTTL time.Duration
+	// TokenRetention is how long an issued token is kept on record past its
+	// expiry (0: forever).
+	TokenRetention time.Duration
+}
+
+// Maintain expires pending requests past their TTL and approved requests
+// unclaimed past UnclaimedTTL, deletes finished requests older than Retain,
+// and deletes issued-token records expired for longer than TokenRetention.
+// Registrations are kept.
+func (s *Store) Maintain(ctx context.Context, opts MaintainOptions) error {
 	now := s.now()
 	if _, err := s.db.ExecContext(ctx, `UPDATE requests SET status = ? WHERE status IN (?, ?) AND expires_at <= ?`,
 		ReqExpired, ReqPending, ReqCallbackPending, now.Unix()); err != nil {
 		return fmt.Errorf("store: expiring requests: %w", err)
 	}
-	if retain > 0 {
+	if opts.UnclaimedTTL > 0 {
+		if _, err := s.db.ExecContext(ctx, `UPDATE requests SET status = ? WHERE status = ? AND decided_at < ?`,
+			ReqExpired, ReqApproved, now.Add(-opts.UnclaimedTTL).Unix()); err != nil {
+			return fmt.Errorf("store: expiring unclaimed requests: %w", err)
+		}
+	}
+	if opts.Retain > 0 {
 		if _, err := s.db.ExecContext(ctx, `DELETE FROM requests WHERE status IN (?, ?, ?, ?, ?) AND created_at < ?`,
-			ReqExpired, ReqDenied, ReqFailed, ReqIssued, ReqClaimed, now.Add(-retain).Unix()); err != nil {
+			ReqExpired, ReqDenied, ReqFailed, ReqIssued, ReqClaimed, now.Add(-opts.Retain).Unix()); err != nil {
 			return fmt.Errorf("store: purging requests: %w", err)
+		}
+	}
+	if opts.TokenRetention > 0 {
+		if _, err := s.db.ExecContext(ctx, `DELETE FROM issued_tokens WHERE expires_at < ?`,
+			now.Add(-opts.TokenRetention).Unix()); err != nil {
+			return fmt.Errorf("store: purging issued tokens: %w", err)
 		}
 	}
 	return nil

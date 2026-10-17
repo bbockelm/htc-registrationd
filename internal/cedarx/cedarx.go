@@ -105,3 +105,34 @@ func HardenCommands(srv *cedarserver.Server, cmds ...int) {
 		return &c
 	}
 }
+
+// RequireEncryption makes srv negotiate cmds with authentication, encryption
+// and integrity required, by whatever methods the per-command policy already
+// allows, layered over that policy. Call it after installing the policy.
+func RequireEncryption(srv *cedarserver.Server, cmds ...int) {
+	set := make(map[int]bool, len(cmds))
+	for _, c := range cmds {
+		set[c] = true
+	}
+	prev := srv.SecurityConfigForCommand
+	srv.SecurityConfigForCommand = func(cmd int) *security.SecurityConfig {
+		var sc *security.SecurityConfig
+		if prev != nil {
+			sc = prev(cmd)
+		}
+		if !set[cmd] {
+			return sc
+		}
+		if sc == nil {
+			sc = srv.SecurityConfig
+		}
+		c := *sc
+		c.Authentication = security.SecurityRequired
+		c.Encryption = security.SecurityRequired
+		c.Integrity = security.SecurityRequired
+		if len(c.CryptoMethods) == 0 {
+			c.CryptoMethods = []security.CryptoMethod{security.CryptoAES}
+		}
+		return &c
+	}
+}

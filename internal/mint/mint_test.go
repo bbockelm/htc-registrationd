@@ -21,13 +21,14 @@ func newMinter(t *testing.T, keyID string) *Minter {
 		t.Fatal(err)
 	}
 	return &Minter{
-		KeyDir:   dir,
-		KeyID:    keyID,
-		Issuer:   "users.htcondor.org",
-		Domain:   "users.htcondor.org",
-		Limits:   []string{"ADVERTISE_SCHEDD"},
-		Lifetime: 72 * time.Hour,
-		ReadKey:  os.ReadFile,
+		KeyDir:      dir,
+		PoolKeyFile: filepath.Join(dir, "POOL"),
+		KeyID:       keyID,
+		Issuer:      "users.htcondor.org",
+		Domain:      "users.htcondor.org",
+		Limits:      []string{"ADVERTISE_SCHEDD"},
+		Lifetime:    72 * time.Hour,
+		ReadKey:     os.ReadFile,
 	}
 }
 

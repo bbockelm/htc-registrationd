@@ -37,18 +37,20 @@ const (
 // pair is an in-process registrar and CE, each a cedar server on loopback,
 // authenticating with certificates from a test CA.
 type pair struct {
-	t          *testing.T
-	ca         *testpki.CA
-	keyDir     string
-	svc        *registrar.Service
-	store      *registrar.Store
-	regAddr    string
-	ceAddr     string
-	mgr        *Manager
-	stateDir   string
-	tokenFile  string
-	reconfigs  atomic.Int32
-	adminToken string
+	t         *testing.T
+	ca        *testpki.CA
+	keyDir    string
+	svc       *registrar.Service
+	store     *registrar.Store
+	regAddr   string
+	ceAddr    string
+	mgr       *Manager
+	stateDir  string
+	tokenFile string
+	reconfigs atomic.Int32
+	// failReconfig makes the master's reconfig fail.
+	failReconfig atomic.Bool
+	adminToken   string
 }
 
 type pairOptions struct {
@@ -152,12 +154,14 @@ func newPair(t *testing.T, opts pairOptions) *pair {
 		CallbackSecurity: func() *security.SecurityConfig {
 			return &security.SecurityConfig{CAFile: p.ca.CertFile}
 		},
-		CallbackConnectTimeout: 5 * time.Second,
-		CallbackTimeout:        15 * time.Second,
-		CallbackBackoff:        time.Millisecond,
-		PollInterval:           time.Second,
-		VerificationURI:        "https://registrar.test/approve",
-		Logger:                 logger,
+		Tunables: registrar.Tunables{
+			CallbackConnectTimeout: 5 * time.Second,
+			CallbackTimeout:        15 * time.Second,
+			CallbackBackoff:        time.Millisecond,
+			PollInterval:           time.Second,
+			VerificationURI:        "https://registrar.test/approve",
+		},
+		Logger: logger,
 	}, store)
 	if err != nil {
 		t.Fatal(err)
@@ -168,6 +172,7 @@ func newPair(t *testing.T, opts pairOptions) *pair {
 	rsrv.Authorizer = authorizer
 	svc.Register(rsrv)
 	cedarx.HardenCommands(rsrv, protocol.RegRequest, protocol.RegPoll, protocol.RegRenew)
+	cedarx.RequireEncryption(rsrv, protocol.AdminCommands...)
 	p.regAddr = serve(t, rsrv)
 
 	// CE.
@@ -189,7 +194,6 @@ func newPair(t *testing.T, opts pairOptions) *pair {
 		RegistrarServerName: registrarName,
 		StateDir:            p.stateDir,
 		TokenFile:           p.tokenFile,
-		Limits:              "ADVERTISE_SCHEDD",
 		Version:             "test",
 		CallbackAddress:     func() (string, error) { return "<" + p.ceAddr + ">", nil },
 		SSLServerAvailable: func() (bool, string) {
@@ -200,6 +204,9 @@ func newPair(t *testing.T, opts pairOptions) *pair {
 		},
 		ClientSecurity: func() *security.SecurityConfig { return &security.SecurityConfig{CAFile: p.ca.CertFile} },
 		Reconfig: func(context.Context) error {
+			if p.failReconfig.Load() {
+				return errors.New("the master is not answering")
+			}
 			p.reconfigs.Add(1)
 			return nil
 		},
@@ -333,8 +340,8 @@ func TestCallbackIssuanceAndRenewal(t *testing.T) {
 		t.Fatalf("next step in %s, want about %s", wait, want)
 	}
 	// The next step only waits for the renewal point.
-	if w := p.step(); w < 30*time.Hour || w > 37*time.Hour {
-		t.Fatalf("idle step waits %s, want ~36h", w)
+	if w := p.step(); w < 28*time.Hour || w > 44*time.Hour {
+		t.Fatalf("idle step waits %s, want 40-60%% of 72h", w)
 	}
 	regs, err := p.store.ListRegistrations(context.Background())
 	if err != nil || len(regs) != 1 || regs[0].Status != registrar.RegActive || regs[0].Method != protocol.MethodCallback {
@@ -651,7 +658,7 @@ func TestApprovalFlow(t *testing.T) {
 	}
 
 	// An unauthenticated or non-admin caller cannot approve.
-	ack := p.adminCall(protocol.RegAdminApprove, &protocol.AdminTarget{UserCode: strings.ToLower(st.UserCode)})
+	ack := p.adminCall(protocol.RegAdminApprove, &protocol.AdminTarget{UserCode: strings.ToLower(st.UserCode), Name: ceName})
 	if s, _ := ack[0].EvaluateAttrString(protocol.AttrStatus); s != protocol.StatusOK {
 		t.Fatalf("approve: %v", ack[0])
 	}
@@ -745,7 +752,7 @@ func TestApprovalResumesAfterRestart(t *testing.T) {
 	if got := m2.State(); got.RequestID != before.RequestID || got.Nonce != before.Nonce {
 		t.Fatalf("restarted state %+v", got)
 	}
-	p.adminCall(protocol.RegAdminApprove, &protocol.AdminTarget{UserCode: before.UserCode})
+	p.adminCall(protocol.RegAdminApprove, &protocol.AdminTarget{UserCode: before.UserCode, Name: ceName})
 	p.mgr = m2
 	p.step()
 	p.verifyToken()
@@ -801,20 +808,58 @@ func TestUnencryptedRefused(t *testing.T) {
 	}
 }
 
-// TestStartupReconfig: a token installed after the last reconfig triggers a
-// reconfig at startup.
-func TestStartupReconfig(t *testing.T) {
+// TestReconfigRetried: a token installed after the local master's last
+// reconfig (here: before a crash) is reconfigured at the next step, and a
+// failed reconfig is retried, with the wait capped, until it succeeds.
+func TestReconfigRetried(t *testing.T) {
 	p := newPair(t, pairOptions{})
-	if err := p.mgr.update(func(s *State) { s.TokenInstalledAt, s.LastReconfig = 200, 100 }); err != nil {
+	now := time.Now().Unix()
+	if err := p.mgr.update(func(s *State) {
+		s.Method, s.TokenIssuedAt, s.TokenExpiry, s.TokenRenewAt = MethodCallback, now, now+72*3600, now+36*3600
+		s.TokenGeneration, s.ReconfiguredGeneration = 2, 1
+	}); err != nil {
 		t.Fatal(err)
 	}
-	p.mgr.startupReconfig(context.Background())
-	if p.reconfigs.Load() != 1 {
-		t.Fatalf("reconfigs %d, want 1", p.reconfigs.Load())
+	p.failReconfig.Store(true)
+	if w := p.step(); w > time.Second {
+		t.Fatalf("with a failed reconfig the step waits %s, want the short retry delay", w)
 	}
-	p.mgr.startupReconfig(context.Background())
+	if !p.mgr.State().NeedsReconfig() {
+		t.Fatal("a failed reconfig was recorded as done")
+	}
+	p.failReconfig.Store(false)
+	if w := p.step(); w < 30*time.Hour {
+		t.Fatalf("after the reconfig succeeded the step waits %s, want the renewal time", w)
+	}
+	if p.reconfigs.Load() != 1 || p.mgr.State().NeedsReconfig() {
+		t.Fatalf("reconfigs %d, needs %v", p.reconfigs.Load(), p.mgr.State().NeedsReconfig())
+	}
+	p.step()
 	if p.reconfigs.Load() != 1 {
 		t.Fatal("reconfigured again with nothing new installed")
+	}
+}
+
+// TestStateFromBeforeGenerations: a state file written before reconfig
+// generations were kept still reconfigures for a token installed after the
+// last reconfig, and only then.
+func TestStateFromBeforeGenerations(t *testing.T) {
+	for _, tc := range []struct {
+		installed, reconfigured int64
+		need                    bool
+	}{{200, 100, true}, {200, 200, true}, {200, 300, false}, {0, 0, false}} {
+		dir := t.TempDir()
+		if err := SaveState(dir, &State{TokenInstalledAt: tc.installed, LastReconfig: tc.reconfigured}); err != nil {
+			t.Fatal(err)
+		}
+		st, err := LoadState(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.NeedsReconfig() != tc.need {
+			t.Errorf("installed %d, reconfigured %d: needs reconfig %v, want %v",
+				tc.installed, tc.reconfigured, st.NeedsReconfig(), tc.need)
+		}
 	}
 }
 

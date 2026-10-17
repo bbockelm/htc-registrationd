@@ -83,6 +83,13 @@ func CommandName(cmd int) string {
 	return ""
 }
 
-// EncryptedCommands are the commands whose handlers refuse an unencrypted
-// session. They carry nonces, request ids, refresh secrets or tokens.
+// EncryptedCommands are the commands that negotiate SSL only, with
+// encryption required, and whose handlers refuse an unencrypted session. They
+// carry nonces, request ids, refresh secrets or tokens.
 var EncryptedCommands = []int{RegRequest, RegPoll, RegRenew, RegCallback}
+
+// AdminCommands are the registrar's administration commands. They
+// authenticate by any method the ADMINISTRATOR level allows, but require
+// encryption, and their handlers refuse an unencrypted session: they carry
+// user codes, decisions and the registration list.
+var AdminCommands = []int{RegAdminList, RegAdminApprove, RegAdminDeny, RegAdminRevoke}

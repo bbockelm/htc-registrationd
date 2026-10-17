@@ -6,28 +6,40 @@
 //
 // Every state file the CE daemon keeps, and the token it installs, goes
 // through here, so a crash never leaves a torn registration.json, status.json,
-// approval-url or token file.
+// approval-url or token file. A crash can leave the temporary file behind;
+// RemoveTemps clears those at startup.
 package atomicfile
 
 import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // hook, when non-nil, is called at named points of WriteFile. Tests use it to
 // simulate a crash between steps.
 var hook func(step string) error
 
+// tempPattern is the os.CreateTemp pattern of path's temporary files.
+func tempPattern(base string) string { return "." + base + ".tmp-*" }
+
 // WriteFile atomically replaces path with data, leaving it with mode perm.
+//
+// Once the rename has happened the new contents are what a reader sees, so a
+// failure to fsync the directory afterwards is logged and WriteFile still
+// succeeds: reporting it as a failure would leave the caller holding the old
+// state in memory while the file holds the new one. Only the rename's
+// durability across a power loss is in doubt.
 func WriteFile(path string, data []byte, perm fs.FileMode) (err error) {
 	dir, base := filepath.Split(path)
 	if dir == "" {
 		dir = "."
 	}
-	tmp, err := os.CreateTemp(dir, "."+base+".tmp-*")
+	tmp, err := os.CreateTemp(dir, tempPattern(base))
 	if err != nil {
 		return fmt.Errorf("atomicfile: creating temporary file for %s: %w", path, err)
 	}
@@ -60,10 +72,33 @@ func WriteFile(path string, data []byte, perm fs.FileMode) (err error) {
 	if err = os.Rename(tmpName, path); err != nil {
 		return fmt.Errorf("atomicfile: renaming %s to %s: %w", tmpName, path, err)
 	}
-	if err = SyncDir(dir); err != nil {
-		return err
+	if serr := syncDir(dir); serr != nil {
+		slog.Warn("atomicfile: the file was replaced, but the directory fsync failed", "file", path, "err", serr)
 	}
 	return nil
+}
+
+// RemoveTemps removes the temporary files a crash in WriteFile(path, ...)
+// can leave beside path. Nothing else in the directory is touched.
+func RemoveTemps(path string) error {
+	dir, base := filepath.Split(path)
+	if dir == "" {
+		dir = "."
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, tempPattern(base)))
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, m := range matches {
+		if !strings.HasPrefix(filepath.Base(m), "."+base+".tmp-") {
+			continue
+		}
+		if err := os.Remove(m); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // Remove removes path (absence is not an error) and fsyncs its directory, so
@@ -75,6 +110,9 @@ func Remove(path string) error {
 	dir := filepath.Dir(path)
 	return SyncDir(dir)
 }
+
+// syncDir is SyncDir, replaceable by tests.
+var syncDir = SyncDir
 
 // SyncDir fsyncs a directory so a rename or removal in it is durable.
 func SyncDir(dir string) error {
