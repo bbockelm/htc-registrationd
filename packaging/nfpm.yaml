@@ -1,0 +1,61 @@
+# Package definition for htc-registrationd, built by `make rpm`.
+name: htc-registrationd
+arch: ${PKG_ARCH}
+platform: linux
+version: ${PKG_VERSION}
+release: ${PKG_RELEASE}
+version_schema: none
+section: net
+priority: optional
+maintainer: ${PKG_MAINTAINER}
+description: |
+  CE registration daemon for HTCondor-CE.
+
+  Gets an HTCondor-CE a short-lived IDTOKEN for advertising to its
+  CE-Collector, and renews it. The same binary runs as the CE side, under
+  the CE's condor_ce_master, or as the registrar that mints the tokens,
+  under the CE-Collector's master. Installed as htc-registration, it is the
+  command-line tool.
+vendor: ${PKG_VENDOR}
+homepage: https://github.com/bbockelm/htc-registrationd
+
+depends:
+  # Started by condor_master and reads the pool configuration.
+  - condor
+
+contents:
+  # Staged by `make rpm` (PKG_STAGE): nfpm expands environment variables in
+  # scalar fields but globs contents.src literally, so a ${...} here finds no
+  # files. This path and PKG_STAGE are one fact written twice.
+  - src: packaging/staging/htc-registrationd
+    dst: /usr/sbin/htc-registrationd
+    file_info:
+      mode: 0755
+
+  # The command-line tool is the same binary, selected by its name.
+  - src: /usr/sbin/htc-registrationd
+    dst: /usr/bin/htc-registration
+    type: symlink
+
+  - src: packaging/50-htc-registrationd-ce.conf
+    dst: /etc/condor-ce/config.d/50-htc-registrationd-ce.conf
+    type: config|noreplace
+    file_info:
+      mode: 0644
+
+  - src: packaging/50-htc-registrationd-registrar.conf
+    dst: /etc/condor-ce/config.d/50-htc-registrationd-registrar.conf
+    type: config|noreplace
+    file_info:
+      mode: 0644
+
+  - src: README.md
+    dst: /usr/share/doc/htc-registrationd/README.md
+    type: doc
+    file_info:
+      mode: 0644
+
+rpm:
+  group: System Environment/Daemons
+  # Compression that every EL8+ host can read.
+  compression: gzip
