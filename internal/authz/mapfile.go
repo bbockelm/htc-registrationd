@@ -27,6 +27,11 @@ const MapfileMethod = "OIDC"
 // every HTCondor map file, the first line whose principal matches wins, so
 // a principal's names belong on one line.
 //
+// \N in the names is replaced by the regex's group N (\0 is the whole
+// match, or the principal on a literal line). Substituted text is part of
+// a name, never a separator or a pattern: a line whose substituted text
+// contains a comma, a glob character or a backslash allows nothing.
+//
 // Only literal names are Known: a glob cannot vouch for a specific name
 // in callback mode.
 //
@@ -56,17 +61,24 @@ type fileStamp struct {
 // statFailed marks a file that could not be stat'ed.
 var statFailed = fileStamp{size: -1}
 
+// mapSnapshot is one loaded version of the file. mapfile.MapFile parses
+// it; the OIDC lines are matched here, as MapFile.Map matches them, because
+// Map returns only the substituted text and authorization must know which
+// parts of it came from the principal.
 type mapSnapshot struct {
-	mf    *mapfile.MapFile
 	stamp fileStamp
-	// lines matches principals to the line that wins, for Reason.
+	// lines are the OIDC lines in file order.
 	lines []lineMatcher
-	known map[string]bool
+	// literals maps a literal principal to the index in lines of the first
+	// literal line for it.
+	literals map[string]int
+	known    map[string]bool
 }
 
 type lineMatcher struct {
 	entry mapfile.Entry
-	re    *regexp.Regexp
+	// re is set on a regular-expression line.
+	re *regexp.Regexp
 }
 
 // NewMapfile loads path. A file that does not load at startup is an error.
@@ -86,13 +98,6 @@ func NewMapfile(path string, log *slog.Logger) (*Mapfile, error) {
 // Name implements Backend.
 func (*Mapfile) Name() string { return "mapfile" }
 
-// Path returns the file in use.
-func (m *Mapfile) Path() string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.path
-}
-
 func stat(path string) (fileStamp, error) {
 	fi, err := os.Stat(path)
 	if err != nil {
@@ -110,10 +115,11 @@ func loadMapfile(p string) (*mapSnapshot, error) {
 	if err != nil {
 		return nil, fmt.Errorf("authorization mapfile: %w", err)
 	}
-	snap := &mapSnapshot{mf: mf, stamp: st, known: map[string]bool{}}
+	snap := &mapSnapshot{stamp: st, literals: map[string]int{}, known: map[string]bool{}}
 	for _, e := range mf.Entries(MapfileMethod) {
 		lm := lineMatcher{entry: e}
 		if e.Regex {
+			// The same flags mapfile.Load compiled the pattern with.
 			flags := ""
 			if e.IgnoreCase {
 				flags += "i"
@@ -125,9 +131,11 @@ func loadMapfile(p string) (*mapSnapshot, error) {
 			if flags != "" {
 				src = "(?" + flags + ")" + src
 			}
-			// mapfile.Load has already compiled this pattern; a failure
-			// here only costs the line number in Reason.
-			lm.re, _ = regexp.Compile(src)
+			if lm.re, err = regexp.Compile(src); err != nil {
+				return nil, fmt.Errorf("authorization mapfile: %s line %d: %w", e.File, e.Line, err)
+			}
+		} else if _, dup := snap.literals[e.Principal]; !dup {
+			snap.literals[e.Principal] = len(snap.lines)
 		}
 		snap.lines = append(snap.lines, lm)
 		for _, n := range splitNames(e.Canonicalization) {
@@ -220,48 +228,111 @@ func matchName(pattern, name string) bool {
 	return err == nil && ok
 }
 
-// winningLine returns the line whose principal matches first, in file
-// order, as the map file's lookup does.
-func (s *mapSnapshot) winningLine(principal string) (mapfile.Entry, bool) {
-	for _, l := range s.lines {
-		switch {
-		case !l.entry.Regex && l.entry.Principal == principal:
-			return l.entry, true
-		case l.entry.Regex && l.re != nil && l.re.MatchString(principal):
-			return l.entry, true
+// match returns the line that wins for principal and its groups for \N,
+// as MapFile.Map chooses them: the first regular-expression line that
+// matches and comes before the principal's first literal line, else that
+// literal line (whose \0 is the principal).
+func (s *mapSnapshot) match(principal string) (*lineMatcher, []string, bool) {
+	lit, haveLit := s.literals[principal]
+	for i := range s.lines {
+		if haveLit && i > lit {
+			break
+		}
+		if l := &s.lines[i]; l.re != nil {
+			if groups, ok := regexGroups(l.re, principal); ok {
+				return l, groups, true
+			}
 		}
 	}
-	return mapfile.Entry{}, false
+	if haveLit {
+		return &s.lines[lit], []string{principal}, true
+	}
+	return nil, nil, false
 }
 
-func (m *Mapfile) lineRef(e mapfile.Entry, ok bool) string {
-	if !ok {
-		return "a mapfile line"
+// regexGroups searches principal with re and returns the groups as
+// MapFile.Map substitutes them: up to the highest group that took part in
+// the match, with groups that did not take part empty.
+func regexGroups(re *regexp.Regexp, principal string) ([]string, bool) {
+	loc := re.FindStringSubmatchIndex(principal)
+	if loc == nil {
+		return nil, false
 	}
-	if e.File == "" || e.File == m.Path() {
-		return fmt.Sprintf("mapfile line %d", e.Line)
+	n := len(loc) / 2
+	for n > 1 && loc[2*(n-1)] < 0 {
+		n--
 	}
-	return fmt.Sprintf("%s line %d", e.File, e.Line)
+	groups := make([]string, n)
+	for i := range n {
+		if loc[2*i] >= 0 {
+			groups[i] = principal[loc[2*i]:loc[2*i+1]]
+		}
+	}
+	return groups, true
 }
 
-// Decide implements Backend.
+// unsafeSubstitution are the characters substituted text may not contain:
+// the name separator and everything isGlob and path.Match treat specially.
+const unsafeSubstitution = `,*?[\`
+
+// substitute replaces \N in canon with group N, as MapFile.Map does (a
+// backslash before anything else is kept with the character after it, and
+// a trailing backslash is dropped). It reports false when a substituted
+// group contains a character from unsafeSubstitution, so text from the
+// principal can only ever be matched literally.
+func substitute(canon string, groups []string) (string, bool) {
+	if strings.IndexByte(canon, '\\') < 0 {
+		return canon, true
+	}
+	var b strings.Builder
+	for i := 0; i < len(canon); i++ {
+		c := canon[i]
+		if c != '\\' {
+			b.WriteByte(c)
+			continue
+		}
+		i++
+		if i == len(canon) {
+			break
+		}
+		if d := int(canon[i]) - '0'; d >= 0 && d <= 9 && d < len(groups) {
+			if strings.ContainsAny(groups[d], unsafeSubstitution) {
+				return "", false
+			}
+			b.WriteString(groups[d])
+			continue
+		}
+		b.WriteByte('\\')
+		b.WriteByte(canon[i])
+	}
+	return b.String(), true
+}
+
+// Decide implements Backend. The UI shows Reason; Source names the file
+// and line for the audit log.
 func (m *Mapfile) Decide(_ context.Context, principal, name string) (Decision, error) {
 	snap := m.current()
 	if snap == nil {
 		return Decision{}, errors.New("no mapfile is loaded")
 	}
-	canon, ok := snap.mf.Map(MapfileMethod, principal)
+	l, groups, ok := snap.match(principal)
 	if !ok {
-		return Decision{Reason: "No mapfile line matches your identity"}, nil
+		return Decision{Reason: "The registrar's map file does not name you"}, nil
 	}
-	e, found := snap.winningLine(principal)
-	ref := m.lineRef(e, found)
+	src := fmt.Sprintf("%s line %d", l.entry.File, l.entry.Line)
+	notListed := Decision{Reason: "The registrar's map file does not allow you to approve " + name, Source: src}
+	canon, ok := substitute(l.entry.Canonicalization, groups)
+	if !ok {
+		m.Logger.Warn("authz: refusing a mapfile substitution with a comma, glob character or backslash",
+			"line", src, "principal", principal)
+		return notListed, nil
+	}
 	for _, n := range splitNames(canon) {
 		if matchName(n, name) {
-			return Decision{Allowed: true, Reason: ref}, nil
+			return Decision{Allowed: true, Reason: "Allowed by the registrar's map file", Source: src}, nil
 		}
 	}
-	return Decision{Reason: fmt.Sprintf("%s does not list %s", capitalize(ref), name)}, nil
+	return notListed, nil
 }
 
 // Known implements Backend.
@@ -271,11 +342,4 @@ func (m *Mapfile) Known(_ context.Context, name string) (bool, error) {
 		return false, errors.New("no mapfile is loaded")
 	}
 	return snap.known[strings.ToLower(name)], nil
-}
-
-func capitalize(s string) string {
-	if s == "" || s[0] < 'a' || s[0] > 'z' {
-		return s
-	}
-	return string(s[0]-'a'+'A') + s[1:]
 }

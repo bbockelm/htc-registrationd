@@ -6,8 +6,11 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/bbockelm/golang-htcondor/mapfile"
 
 	"github.com/bbockelm/htc-registrationd/internal/knobs"
 	"github.com/bbockelm/htc-registrationd/internal/registrar"
@@ -46,26 +49,31 @@ func TestMapfileDecide(t *testing.T) {
 	m, _, _ := newTestMapfile(t)
 	ctx := context.Background()
 	alice := "alice"
+	const (
+		allowed  = "Allowed by the registrar's map file"
+		unnamed  = "The registrar's map file does not name you"
+		notAllow = "The registrar's map file does not allow you to approve "
+	)
 	cases := []struct {
 		principal, name string
 		allowed         bool
-		reason          string
+		reason, source  string
 	}{
-		{alice, "ce1.example.edu", true, "mapfile line 2"},
-		{alice, "CE1.EXAMPLE.EDU", true, "mapfile line 2"},
-		{alice, "x.grid.example.org", true, "mapfile line 2"},
-		{alice, "X.Grid.Example.ORG", true, "mapfile line 2"},
-		{alice, "grid.example.org", false, "Mapfile line 2 does not list grid.example.org"},
-		{alice, "ce2.example.edu", false, "Mapfile line 2 does not list ce2.example.edu"},
-		{"bob", "ce2.example.edu", true, "mapfile line 3"},
+		{alice, "ce1.example.edu", true, allowed, "line 2"},
+		{alice, "CE1.EXAMPLE.EDU", true, allowed, "line 2"},
+		{alice, "x.grid.example.org", true, allowed, "line 2"},
+		{alice, "X.Grid.Example.ORG", true, allowed, "line 2"},
+		{alice, "grid.example.org", false, notAllow + "grid.example.org", "line 2"},
+		{alice, "ce2.example.edu", false, notAllow + "ce2.example.edu", "line 2"},
+		{"bob", "ce2.example.edu", true, allowed, "line 3"},
 		// The first matching line wins; line 6 never applies.
-		{"bob", "ce-never.example.edu", false, "Mapfile line 3 does not list ce-never.example.edu"},
+		{"bob", "ce-never.example.edu", false, notAllow + "ce-never.example.edu", "line 3"},
 		// Only OIDC lines count.
-		{"bob", "ignored.example.edu", false, "Mapfile line 3 does not list ignored.example.edu"},
-		{"carol-42", "ce4.example.edu", true, "mapfile line 5"},
-		{"carol-x", "ce4.example.edu", false, "No mapfile line matches your identity"},
-		{"https://idp.example.org,alice", "ce1.example.edu", false, "No mapfile line matches your identity"},
-		{"", "ce1.example.edu", false, "No mapfile line matches your identity"},
+		{"bob", "ignored.example.edu", false, notAllow + "ignored.example.edu", "line 3"},
+		{"carol-42", "ce4.example.edu", true, allowed, "line 5"},
+		{"carol-x", "ce4.example.edu", false, unnamed, ""},
+		{"https://idp.example.org,alice", "ce1.example.edu", false, unnamed, ""},
+		{"", "ce1.example.edu", false, unnamed, ""},
 	}
 	for _, tc := range cases {
 		d, err := m.Decide(ctx, tc.principal, tc.name)
@@ -74,6 +82,106 @@ func TestMapfileDecide(t *testing.T) {
 		}
 		if d.Allowed != tc.allowed || d.Reason != tc.reason {
 			t.Errorf("Decide(%q, %q) = %+v, want allowed=%v reason %q", tc.principal, tc.name, d, tc.allowed, tc.reason)
+		}
+		// The file and line go to the audit log, never into Reason.
+		if (tc.source == "") != (d.Source == "") || !strings.HasSuffix(d.Source, tc.source) ||
+			strings.Contains(d.Reason, "line") || strings.Contains(d.Reason, "/") {
+			t.Errorf("Decide(%q, %q): reason %q, source %q; want source ending %q", tc.principal, tc.name, d.Reason, d.Source, tc.source)
+		}
+	}
+}
+
+// substitutionMap uses \N; captured text must only ever match literally.
+const substitutionMap = `OIDC /^(.+)@site\.edu$/ \1.site.edu
+OIDC /^grid-(.*)$/ ce.\1.example.org,static.example.org
+OIDC /^(x)|(y)$/ \2.example.org
+OIDC lit \0.example.org
+OIDC /^esc$/ a\b.example.org,\9.example.org
+`
+
+func TestMapfileSubstitutionIsLiteral(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "authz.map")
+	writeMap(t, path, substitutionMap)
+	m, err := NewMapfile(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	cases := []struct {
+		principal, name string
+		allowed         bool
+	}{
+		{"victim@site.edu", "victim.site.edu", true},
+		{"victim@site.edu", "VICTIM.site.edu", true},
+		// A comma in the captured text does not split the names.
+		{"evil.com,x@site.edu", "evil.com", false},
+		{"evil.com,x@site.edu", "x.site.edu", false},
+		// Glob characters in the captured text are not patterns.
+		{"*@site.edu", "victim.site.edu", false},
+		{"*@site.edu", "*.site.edu", false},
+		{"?ictim@site.edu", "victim.site.edu", false},
+		{"[v]ictim@site.edu", "victim.site.edu", false},
+		{`victi\m@site.edu`, "victim.site.edu", false},
+		// The refusal covers the whole line, even its fixed names.
+		{"grid-a", "ce.a.example.org", true},
+		{"grid-a", "static.example.org", true},
+		{"grid-a,b", "static.example.org", false},
+		{"grid-a*", "static.example.org", false},
+		// A group that did not take part substitutes as empty; one past
+		// the last that did is left as written.
+		{"y", "y.example.org", true},
+		{"x", ".example.org", false},
+		// \0 on a literal line is the principal.
+		{"lit", "lit.example.org", true},
+		// A backslash that is not \N stays a backslash (a glob escape) and
+		// a group past the last one is left alone.
+		{"esc", "ab.example.org", true},
+	}
+	for _, tc := range cases {
+		d, err := m.Decide(ctx, tc.principal, tc.name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d.Allowed != tc.allowed {
+			t.Errorf("Decide(%q, %q) = %+v, want allowed=%v", tc.principal, tc.name, d, tc.allowed)
+		}
+	}
+	if ok, _ := m.Known(ctx, "victim.site.edu"); ok {
+		t.Error("a substituted name is Known")
+	}
+	if ok, _ := m.Known(ctx, "static.example.org"); !ok {
+		t.Error("a literal name beside a substitution is not Known")
+	}
+}
+
+// TestMapfileMatchesHTCondorLookup checks that the line and text chosen
+// here are the ones mapfile.MapFile.Map chooses.
+func TestMapfileMatchesHTCondorLookup(t *testing.T) {
+	content := testMap + substitutionMap + `OIDC /^d/ first-regex.example.org
+OIDC dave literal.example.org
+OIDC /^dave$/ later-regex.example.org
+OIDC /^E(V)E$/i \1.example.org
+`
+	path := filepath.Join(t.TempDir(), "authz.map")
+	writeMap(t, path, content)
+	snap, err := loadMapfile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mf, err := mapfile.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"alice", "bob", "carol-42", "carol-x", "victim@site.edu", "grid-a", "x", "y", "lit",
+		"esc", "dave", "dan", "eve", "EVE", "nobody", ""} {
+		want, wantOK := mf.Map(MapfileMethod, p)
+		var got string
+		l, groups, ok := snap.match(p)
+		if ok {
+			got, _ = substitute(l.entry.Canonicalization, groups)
+		}
+		if ok != wantOK || got != want {
+			t.Errorf("%q: got %q, %v; mapfile.Map gives %q, %v", p, got, ok, want, wantOK)
 		}
 	}
 }

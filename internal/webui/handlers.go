@@ -403,12 +403,12 @@ func (s *Server) handleApproveDecision(w http.ResponseWriter, r *http.Request) {
 	}
 	if !d.Allowed {
 		s.log.Warn("webui: unauthorized decision refused", "principal", sess.Principal, "name", rec.Name,
-			"code", code, "client", clientIP(r))
+			"code", code, "authorization", d.Audit(), "client", clientIP(r))
 		s.message(w, r, http.StatusForbidden, "Not authorized", "You are not authorized to approve "+rec.Name+". "+d.Reason)
 		return
 	}
 	who := approver(sess)
-	if err := s.cfg.Store.Decide(r.Context(), rec.Number, approve, who, d.Reason); err != nil {
+	if err := s.cfg.Store.Decide(r.Context(), rec.Number, approve, who, d.Audit()); err != nil {
 		if errors.Is(err, registrar.ErrNotPending) {
 			http.Redirect(w, r, "/approve?code="+url.QueryEscape(code), http.StatusSeeOther)
 			return
@@ -422,7 +422,7 @@ func (s *Server) handleApproveDecision(w http.ResponseWriter, r *http.Request) {
 		verb = "approved"
 	}
 	s.log.Info("registrar: request "+verb+" in the web UI", "request", rec.Number, "name", rec.Name, "code", code,
-		"by", who.String(), "authorization", d.Reason, "client", clientIP(r))
+		"by", who.String(), "authorization", d.Audit(), "client", clientIP(r))
 	http.Redirect(w, r, "/approve?code="+url.QueryEscape(code), http.StatusSeeOther)
 }
 

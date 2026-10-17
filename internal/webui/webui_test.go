@@ -236,7 +236,7 @@ func TestLoginThenApprove(t *testing.T) {
 		"2027-01-15 08:00 UTC", // requested at
 		"htc-registrationd/test",
 		"You are authorized to approve " + testCE,
-		"mapfile line 1",
+		"Allowed by the registrar&#39;s map file",
 		`value="approve"`,
 		"Alice Admin",
 		// The footer names the user as configuration does: the subject.
@@ -248,6 +248,9 @@ func TestLoginThenApprove(t *testing.T) {
 	}
 	if strings.Contains(body, h.idp.URL()+",alice") {
 		t.Error("approve page shows the issuer-qualified principal")
+	}
+	if strings.Contains(body, "line 1") || strings.Contains(body, h.mapf) {
+		t.Error("approve page shows where in the map file the user is listed")
 	}
 	if h.idp.pkceRejections != 0 || len(h.idp.challenges) != 1 {
 		t.Errorf("PKCE: %d challenges, %d rejections", len(h.idp.challenges), h.idp.pkceRejections)
@@ -268,7 +271,7 @@ func TestLoginThenApprove(t *testing.T) {
 		t.Fatalf("after approving: %d\n%s", code, body)
 	}
 	r := h.status("BCDF-GHJK")
-	if r.Status != registrar.ReqApproved || r.DecidedBy != "oidc:"+h.idp.URL()+",alice" || r.Reason != "mapfile line 1" {
+	if r.Status != registrar.ReqApproved || r.DecidedBy != "oidc:"+h.idp.URL()+",alice" || r.Reason != "Allowed by the registrar's map file ("+h.mapf+" line 1)" {
 		t.Fatalf("request after approval: %+v", r)
 	}
 
@@ -301,7 +304,7 @@ func TestUnauthorizedUserGetsNoButtons(t *testing.T) {
 	h.login(c, "mallory")
 	body, code := h.get(c, "/approve?code=DDDD-FFFF")
 	if code != http.StatusOK || !strings.Contains(body, "You are not authorized to approve "+testCE) ||
-		!strings.Contains(body, "No mapfile line matches your identity") {
+		!strings.Contains(body, "The registrar&#39;s map file does not name you") {
 		t.Fatalf("%d\n%s", code, body)
 	}
 	if strings.Contains(body, `value="approve"`) || strings.Contains(body, `value="deny"`) {
