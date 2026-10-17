@@ -256,9 +256,40 @@ func (m *Manager) HandleRenewNow(ctx context.Context, c *cedarserver.Conn) error
 	return protocol.Send(ctx, c.Stream, &protocol.Ack{Status: protocol.StatusOK, Hint: "renewal scheduled"})
 }
 
+// requestApprovalWait bounds how long REG_REQUEST_APPROVAL waits for the
+// registrar to answer before replying without a URL.
+const requestApprovalWait = 45 * time.Second
+
+// HandleRequestApproval serves REG_REQUEST_APPROVAL (ADMINISTRATOR): start an
+// approval-mode request now, or report the one already pending, and reply
+// with its URL and code.
+func (m *Manager) HandleRequestApproval(ctx context.Context, c *cedarserver.Conn) error {
+	m.log.Info("ce: REG_REQUEST_APPROVAL received", "remote", c.RemoteAddr, "user", c.AuthorizationUser())
+	done := m.RequestApproval()
+	wctx, cancel := context.WithTimeout(ctx, requestApprovalWait)
+	defer cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			return protocol.Send(ctx, c.Stream, &protocol.Ack{Status: protocol.StatusError,
+				Error: protocol.Error{Code: protocol.ErrInternal, Message: "approval request failed: " + err.Error()}})
+		}
+	case <-wctx.Done():
+		return protocol.Send(ctx, c.Stream, &protocol.Ack{Status: protocol.StatusOK,
+			Hint: "approval request scheduled; the registrar has not answered yet (see htc-registration status)"})
+	}
+	s := m.Status()
+	hint := "approve at " + s.ApprovalURL
+	if s.RequestExpires != 0 {
+		hint += " before " + time.Unix(s.RequestExpires, 0).UTC().Format(time.RFC3339)
+	}
+	return protocol.Send(ctx, c.Stream, &protocol.Ack{Status: protocol.StatusOK, Hint: hint})
+}
+
 // Register installs the CE's commands on srv.
 func (m *Manager) Register(srv *cedarserver.Server) {
 	srv.Handle(protocol.RegCallback, m.HandleCallback, "ALLOW")
 	srv.Handle(protocol.RegStatus, m.HandleStatus, "READ")
 	srv.Handle(protocol.RegRenewNow, m.HandleRenewNow, "ADMINISTRATOR")
+	srv.Handle(protocol.RegRequestApproval, m.HandleRequestApproval, "ADMINISTRATOR")
 }

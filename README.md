@@ -22,8 +22,9 @@ A CE proves its name in one of two ways:
   callback connection only. Renewal is a fresh exchange at half the token
   lifetime.
 - **Approval**: the CE publishes an approval URL with a user code
-  (`XXXX-XXXX`). An administrator approves it (for now with
-  `htc-registration approve CODE`), and the CE collects the token by polling.
+  (`XXXX-XXXX`). An administrator opens the URL on the registrar's web UI,
+  logs in with OIDC and approves it (or runs `htc-registration approve CODE`
+  on the registrar), and the CE collects the token by polling.
   Renewal uses a refresh secret with two-phase rotation (current / pending /
   retired) that survives a crash at any point. A superseded secret that shows
   up again revokes the registration.
@@ -73,6 +74,7 @@ servers on loopback, using a generated test CA.
 | `REG_CALLBACK` | 77003 | CE | ALLOW, SSL + encryption |
 | `REG_STATUS` | 77004 | CE | READ |
 | `REG_RENEW_NOW` | 77005 | CE | ADMINISTRATOR |
+| `REG_REQUEST_APPROVAL` | 77006 | CE | ADMINISTRATOR |
 | `REG_ADMIN_LIST` / `APPROVE` / `DENY` / `REVOKE` | 77010-77013 | registrar | ADMINISTRATOR |
 
 ## Configuration
@@ -113,8 +115,8 @@ Registrar:
 - `IDENTITY_DOMAIN`: default `$(UID_DOMAIN)`. The issuer is `TRUST_DOMAIN`.
 - `TOKEN_LIMITS`: default `ADVERTISE_SCHEDD`.
 - `TOKEN_LIFETIME`: default 72 h.
-- `CALLBACK_NAMES`: `authz` | `any` (default `authz`, which refuses every name
-  until an authorization backend exists).
+- `CALLBACK_NAMES`: `authz` | `any` (default `authz`: the name must be known
+  to an `AUTHZ` backend; with no backend every callback is refused).
 - `CALLBACK_ALLOW_NETWORKS`: CIDRs re-allowed for callbacks. Loopback, RFC
   1918, CGNAT, link-local, multicast, ULA, their IPv4-mapped / NAT64 / 6to4
   forms, and the registrar's own addresses are denied by default. The check
@@ -123,8 +125,14 @@ Registrar:
 - `CALLBACK_CONNECT_TIMEOUT` / `CALLBACK_TIMEOUT`: default 10 s / 30 s.
 - `MAX_PENDING_PER_IP` / `MAX_PENDING`: default 10 / 1000.
 - `APPROVAL_TTL` (30 min), `UNCLAIMED_TTL` (24 h), `POLL_INTERVAL` (5 s).
-- `VERIFICATION_URI`: default `https://$(FULL_HOSTNAME)/approve`.
-- `RECHECK_APPROVER` (true), `MAX_REGISTRATION_AGE` (no cap).
+- `VERIFICATION_URI`: default `$(HTC_REGISTRATIOND_PUBLIC_URL)/approve` when
+  the web UI is configured, else `https://$(FULL_HOSTNAME)/approve`. A CE is
+  sent this and `<VERIFICATION_URI>?code=XXXX-XXXX`.
+- `RECHECK_APPROVER` (true): at each approval-mode renewal, the person who
+  approved the registration in the web UI must still be authorized for the
+  name (an administrator, or allowed by an `AUTHZ` backend). Approvals made
+  with `htc-registration approve` (CEDAR `ADMINISTRATOR`) are not re-checked.
+- `MAX_REGISTRATION_AGE` (no cap).
 
 Certificate trust uses the standard HTCondor knobs: `AUTH_SSL_CLIENT_CAFILE`,
 `AUTH_SSL_CLIENT_CADIR` and `AUTH_SSL_CLIENT_USE_DEFAULT_CAS` (default true:
@@ -132,5 +140,84 @@ the system trust store is trusted too) for the connections the daemon makes,
 the CE's to the registrar and the registrar's callbacks, and the
 `AUTH_SSL_SERVER_*` variants for the connections it accepts.
 
-Not built yet: the HTTPS approval UI with OIDC login, and the mapfile and OSG
-Topology authorization backends.
+### Web UI (registrar)
+
+The registrar serves an approval page when a listener is configured. Login is
+OpenID Connect (authorization code with PKCE, identity from the provider's
+userinfo endpoint), done by the daemon itself; headers from a proxy are never
+used as identity.
+
+- `HTTPS_ADDR`, with `HTTPS_CERTFILE` and `HTTPS_KEYFILE`: the HTTPS listener,
+  e.g. `:443`. The key may be root-only. A renewed certificate is picked up
+  within a minute, and on `condor_reconfig`.
+- `HTTP_ADDR`: a plain-HTTP listener on a loopback address (e.g.
+  `127.0.0.1:8080`) for a reverse proxy that terminates TLS. The proxy must
+  set `X-Forwarded-For`; on this listener its last entry is the address
+  requests are rate-limited by, and it is used for nothing else.
+- `PUBLIC_URL`: required; the `https://` origin browsers and CEs use, with no
+  path (`http://` only for a loopback host).
+- `OIDC_ISSUER`: the provider's issuer URL, read via
+  `/.well-known/openid-configuration`. Register `<PUBLIC_URL>/oidc/callback`
+  as the client's redirect URI.
+- `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET_FILE` (may be root-only; re-read on
+  reconfig).
+- `OIDC_SCOPES`: default `openid email profile`. CILogon needs
+  `openid email profile org.cilogon.userinfo` to release `osgid`.
+- `OIDC_PRINCIPAL_CLAIM`: default `sub`, for which a user's principal is
+  `<issuer>,<sub>`. For any other claim the principal is the claim's value.
+  For OSG Topology, set `osgid`.
+- `ADMINS`: registrar administrators, as principals separated by white space
+  (a principal may contain a comma). They may approve any name, and see and
+  revoke every registration. Re-read on reconfig.
+- `SESSION_IDLE` (1 h), `SESSION_LIFETIME` (12 h). Sessions are kept in the
+  registrar's database.
+
+Pages: `/approve` (enter a code, or `/approve?code=XXXX-XXXX`: the request's
+CE name, code, source address and its reverse DNS, time and CE version, and
+whether the logged-in user may approve it and why), `/registrations` (the
+registrations the user approved or is authorized for, all of them for an
+administrator, with revoke), `/healthz`. Login and approve requests are
+rate-limited per client address.
+
+### Authorization backends (registrar)
+
+- `AUTHZ`: `mapfile`, `topology`, or both as a list. A user may approve a
+  name when any listed backend allows it (the first allow wins). A name is
+  known for callback mode (`CALLBACK_NAMES = authz`) when any backend knows
+  it. Changing the list takes a restart.
+
+**mapfile** (`AUTHZ_MAPFILE`): an HTCondor map file. Lines of method `OIDC`
+map a principal to the comma-separated CE names it may approve:
+
+```
+# method  principal (literal, or /regex/)     CE names
+OIDC "https://cilogon.org,http://cilogon.org/serverA/users/1234" ce1.example.edu,*.grid.example.edu
+OIDC /^https:\/\/idp\.example\.org,ops-[0-9]+$/               ce2.example.edu
+```
+
+A regular expression is written between slashes, so a `/` inside it is
+written `\/`. A name is literal or a `path.Match` glob (`*` also matches
+dots); names compare without regard to case. As in any HTCondor map file, only the first
+line whose principal matches is used, so list all of a principal's names on
+that line. Only literal names are known for callback mode: a glob can approve
+names but never makes one known, since callback mode needs the name written
+out. The file is re-read when its modification time changes and on
+reconfig; a file that fails to load leaves the last good one in use, and the
+error is logged.
+
+**topology**: OSG Topology. A user may approve a name when the name is the
+FQDN of an active resource with a CE service and the user's principal (the
+`osgid` claim: set `OIDC_PRINCIPAL_CLAIM = osgid`) is the `CILogonID` of a
+contact in any of its Administrative Contact lists (Primary, Secondary or
+Tertiary). A name is known when it is an active CE's FQDN.
+
+- `TOPOLOGY_URL`: default `https://topology.opensciencegrid.org` (https only).
+- `TOPOLOGY_REFRESH`: default 15 min.
+- `TOPOLOGY_MAX_STALE`: default 24 h. When fetches fail, the last good copy
+  is used until it is this old; after that every decision fails until a fetch
+  succeeds.
+
+### Command line
+
+On a CE, `htc-registration request --approval` starts an approval request now,
+even when the CE is configured for callback, and prints the URL and code.

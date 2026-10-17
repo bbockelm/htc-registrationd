@@ -124,13 +124,16 @@ type Manager struct {
 	cfg Config
 	log *slog.Logger
 
-	mu         sync.Mutex
-	state      *State
-	status     Status
-	live       map[*liveRequest]struct{}
-	force      bool
-	failures   int
-	lastURLLog time.Time
+	mu     sync.Mutex
+	state  *State
+	status Status
+	live   map[*liveRequest]struct{}
+	force  bool
+	// approvalWaiters are REG_REQUEST_APPROVAL callers waiting for the
+	// forced approval request to start.
+	approvalWaiters []chan error
+	failures        int
+	lastURLLog      time.Time
 
 	wake chan struct{}
 }
@@ -198,6 +201,28 @@ func (m *Manager) RenewNow() {
 	}
 }
 
+// RequestApproval asks the run loop to start an approval-mode request now,
+// whatever the configured method, unless one is already pending. The channel
+// receives the outcome: nil once a request is pending (its URL and code are
+// in Status), or the error that prevented one.
+func (m *Manager) RequestApproval() <-chan error {
+	ch := make(chan error, 1)
+	m.mu.Lock()
+	m.approvalWaiters = append(m.approvalWaiters, ch)
+	m.mu.Unlock()
+	select {
+	case m.wake <- struct{}{}:
+	default:
+	}
+	return ch
+}
+
+func notifyWaiters(waiters []chan error, err error) {
+	for _, ch := range waiters {
+		ch <- err
+	}
+}
+
 // Run drives requests and renewals until ctx ends.
 func (m *Manager) Run(ctx context.Context) error {
 	m.startupReconfig(ctx)
@@ -240,14 +265,19 @@ func (m *Manager) Step(ctx context.Context) time.Duration {
 	m.mu.Lock()
 	st := *m.state
 	force := m.force
-	m.force = false
+	waiters := m.approvalWaiters
+	m.force, m.approvalWaiters = false, nil
 	m.mu.Unlock()
 
 	var wait time.Duration
 	var err error
 	switch {
 	case st.RequestID != "":
+		notifyWaiters(waiters, nil)
 		wait, err = m.pollApproval(ctx, &st)
+	case len(waiters) > 0:
+		wait, err = m.startApproval(ctx)
+		notifyWaiters(waiters, err)
 	case st.HasToken(now) && !force && now.Before(st.RenewAt(m.cfg.RenewFraction)):
 		m.setStatus(func(s *Status) {
 			s.State = StateRegistered
