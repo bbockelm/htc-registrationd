@@ -1,0 +1,72 @@
+name: CI
+
+# One in-flight run per pull request; a new push cancels the previous run.
+# Pushes to main are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  GOWORK: 'off'
+
+jobs:
+  test:
+    name: Test (Go ${{ matrix.go-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor named in go.mod, and the toolchain releases are built with.
+        go-version: ['1.26', '1.27']
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Set up Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: ${{ matrix.go-version }}
+        cache: true
+
+    - name: Verify dependencies
+      run: go mod verify
+
+    - name: Build
+      run: make build
+
+    - name: Vet
+      run: go vet ./...
+
+    - name: Test
+      run: go test -race -count=1 -timeout 10m ./...
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Set up Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: '1.27'
+        cache: true
+
+    - name: Run golangci-lint
+      uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+      with:
+        version: v2.13.2
+        args: --timeout=5m
+        # Skip the remote JSON-schema fetch of `golangci-lint config verify`,
+        # which intermittently times out.
+        verify: false
