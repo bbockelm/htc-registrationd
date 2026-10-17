@@ -35,7 +35,7 @@ func (d *Demo) startMaster(ctx context.Context, ce *CE, onReconfig func()) error
 	srv := cedarserver.New(sc)
 	srv.Authorizer = func(perm, _, user string) bool {
 		name, _, _ := strings.Cut(user, "@")
-		return perm == "ADMINISTRATOR" && name == d.user
+		return perm == "ADMINISTRATOR" && (name == d.user || name == d.daemonUser)
 	}
 	srv.Handle(commands.DC_RECONFIG_FULL, func(context.Context, *cedarserver.Conn) error {
 		onReconfig()

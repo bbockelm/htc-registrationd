@@ -1,0 +1,126 @@
+name: Root
+
+# The daemon as it is deployed: started as root by condor_master, dropping to
+# the condor account, reading root-only credentials as root. Tests run as an
+# ordinary user never exercise that.
+
+# One in-flight run per pull request; a new push cancels the previous run.
+# Pushes to main are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  GOWORK: 'off'
+
+jobs:
+  go-test-root:
+    name: Go tests as root
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Set up Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: '1.27'
+        cache: true
+
+    # The account a root daemon drops to, and authenticates as by FS.
+    - name: Create the condor account
+      run: sudo useradd --system --no-create-home --shell /sbin/nologin condor
+
+    # Built as the runner user, run as root: the module and build caches
+    # stay the runner's. TestDemo builds the daemon with go, as root, into a
+    # cache of its own.
+    - name: Test as root
+      run: go test -race -count=1 -timeout 15m -exec "sudo -E env PATH=$PATH GOCACHE=$RUNNER_TEMP/gocache-root" ./...
+
+    # Each of these skips unless it runs as root; a skip here means the root
+    # run checked nothing.
+    - name: Root-only tests ran
+      shell: bash
+      run: |
+        set -o pipefail
+        go test -count=1 -v -exec "sudo -E env PATH=$PATH GOCACHE=$RUNNER_TEMP/gocache-root" \
+          -run '^(TestKeyAsRootAfterDrop|TestRootOnlyCredentialsAfterDrop|TestWriteRootOwned|TestApprovalSurvivesFailedInstall|TestDemo)$' \
+          ./internal/mint ./internal/webui ./internal/atomicfile ./internal/ce ./internal/demo | tee root-tests.txt
+        if grep -E -- '--- SKIP' root-tests.txt; then
+          echo "a root-only test skipped as root"
+          exit 1
+        fi
+        test "$(grep -c -- '--- PASS' root-tests.txt)" -ge 5
+
+  integration-root:
+    name: HTCondor-CE under condor_master, as root
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Set up Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: '1.27'
+        cache: true
+
+    - name: Set up Node
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: '24'
+        cache: 'npm'
+        cache-dependency-path: e2e/package-lock.json
+
+    - name: Install browser test dependencies
+      working-directory: e2e
+      run: |
+        npm ci
+        npx playwright install --with-deps chromium
+
+    # A CE-Collector (htcondor-ce-collector) running the registrar and a CE
+    # (htcondor-ce), from the HTCondor 25.x repository, each under a
+    # condor_master started as root. See the checks in the script.
+    - name: Registrar and CE under condor_master
+      run: test/root/run.sh
+      env:
+        KEEP: '1'
+
+    # The registrar's web UI through the CE-Collector's shared port.
+    - name: Browser tests on the shared port
+      working-directory: e2e
+      run: npx playwright test tests/sharedport.spec.ts
+      env:
+        E2E_SKIP_BUILD: '1'
+        E2E_BROWSERS: chromium
+        E2E_SHAREDPORT_URL: https://collector.test:9619
+        E2E_SHAREDPORT_APPROVAL: ${{ github.workspace }}/test/root/.work/approval.txt
+
+    - name: Daemon logs
+      if: failure()
+      run: test/root/run.sh logs
+
+    - name: Upload report
+      if: failure()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: playwright-report-sharedport
+        path: |
+          e2e/playwright-report/
+          e2e/test-results/
+        retention-days: 7
+
+    - name: Remove the containers
+      if: always()
+      run: test/root/run.sh clean

@@ -60,34 +60,28 @@ func TestExpiredTokenRefreshes(t *testing.T) {
 }
 
 // TestApprovalSurvivesFailedInstall: an approval whose token cannot be
-// installed (tokens.d not writable) keeps the registration, and the next step
-// installs a token by renewing with the stored secret.
+// installed (the token directory is a file, which root cannot write into
+// either) keeps the registration, and the next step installs a token by
+// renewing with the stored secret.
 func TestApprovalSurvivesFailedInstall(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root ignores directory permissions")
-	}
 	p := newPair(t, pairOptions{method: MethodApproval})
 	dir := filepath.Dir(p.tokenFile)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
 	p.step()
 	st := p.mgr.State()
 	p.adminCall(protocol.RegAdminApprove, &protocol.AdminTarget{UserCode: st.UserCode, Name: ceName})
-	if err := os.Chmod(dir, 0o500); err != nil { //nolint:gosec // a directory; owner read+search only
+	if err := os.WriteFile(dir, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) }) //nolint:gosec // a directory
 	time.Sleep(1100 * time.Millisecond)
 	p.step() // claims the approval; the install fails
 	claimed := p.mgr.State()
 	if claimed.RegistrationID == "" || claimed.Pending == "" || claimed.RequestID != "" {
 		t.Fatalf("after the failed install: %+v", claimed)
 	}
-	if _, err := os.Stat(p.tokenFile); !os.IsNotExist(err) {
-		t.Fatalf("token file: %v", err)
+	if _, err := os.Stat(p.tokenFile); err == nil {
+		t.Fatal("a token file was installed")
 	}
-	if err := os.Chmod(dir, 0o700); err != nil { //nolint:gosec // a directory
+	if err := os.Remove(dir); err != nil {
 		t.Fatal(err)
 	}
 	p.step()
