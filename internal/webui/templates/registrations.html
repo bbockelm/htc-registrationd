@@ -19,8 +19,8 @@
 <td>{{.Reg.Method}}</td>
 <td><span class="status status-{{.Reg.Status}}">{{.Reg.Status}}</span></td>
 <td class="wrap">{{.Approver}}</td>
-<td>{{utc .Reg.CreatedAt}}</td>
-<td>{{utc .Reg.TokenExpiry}}</td>
+<td class="time">{{utc .Reg.CreatedAt}}</td>
+<td class="time">{{utc .Reg.TokenExpiry}}</td>
 <td>{{if .CanRevoke}}<form method="post" action="/registrations/revoke" class="inline"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.Reg.ID}}"><button type="submit" class="danger">Revoke</button></form>{{end}}</td>
 </tr>
 {{- end}}

@@ -44,6 +44,8 @@ type base struct {
 	UserName string
 	IsAdmin  bool
 	CSRF     string
+	// Wide lets the page use more of a wide window, for tables.
+	Wide bool
 }
 
 // messagePage is a heading, a statement and an optional link.
