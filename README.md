@@ -1,369 +1,568 @@
 # htc-registrationd
 
-Bootstraps CE → CE-Collector authentication. An HTCondor-CE gets a short-lived
-IDTOKEN for `<ce-name>@<domain>`, limited to `ADVERTISE_SCHEDD`, and renews it
-automatically. It needs no client certificate.
+htc-registrationd keeps an HTCondor-CE advertising to its central
+CE-Collector when its host certificate can no longer be used as a client
+certificate. Let's Encrypt certificates are no longer issued for client use,
+so a CE that advertised with its host certificate stops being accepted when
+that certificate is renewed. With htc-registrationd, the CE gets a
+short-lived IDTOKEN that allows only advertising its Scheduler ad under its
+own name, and renews the token before it expires.
 
-One binary, two daemon modes:
+The same program runs on each CE and beside the CE-Collector, where it is
+called the registrar. A CE proves its name in one of two ways:
 
-| Mode | Runs under | Role |
-|---|---|---|
-| `ce` | the CE's `condor_ce_master` | requests, installs and renews the token |
-| `registrar` | the CE-Collector's master | verifies requests, mints tokens, rotates refresh secrets |
+- **Callback mode.** The CE has a host certificate that names it. The
+  registrar connects back to the CE and checks that certificate. Nobody has
+  to approve anything.
+- **Approval mode.** The CE has no usable host certificate. The CE shows a
+  URL and a code, and an administrator approves the request in the
+  registrar's web page after signing in. Who may approve which CE comes from
+  a map file or from OSG Topology. After the first approval, the CE renews
+  its token without anyone's help.
 
-Run as `htc-registration` (or `htc-registrationd cli ...`), the same binary is
-the command-line tool.
+### Callback mode
 
-A CE proves its name in one of two ways:
+```mermaid
+sequenceDiagram
+    participant CE
+    participant R as Registrar
+    participant C as CE-Collector
+    CE->>R: Request a token for ce.example.edu
+    R->>CE: Connect back to the CE on its HTCondor-CE port
+    Note over R,CE: The registrar checks that the CE host<br/>certificate names ce.example.edu
+    R->>CE: Token for ce.example.edu
+    Note over CE: The CE installs the token in<br/>/etc/condor-ce/tokens.d
+    CE->>C: Advertise the Scheduler ad with the token
+    Note over CE,R: Before the token expires, the CE repeats the exchange
+```
 
-- **Callback**: the CE sends `REG_REQUEST` with its own sinful and a nonce. The
-  registrar calls back over CEDAR, verifies the CE's *server* certificate
-  against the requested name, checks the nonce, and delivers the token on the
-  callback connection only. Renewal is a fresh exchange 40-60% of the way
-  through the token's lifetime (drawn per token).
-- **Approval**: the CE publishes an approval URL with a user code
-  (`XXXX-XXXX`). An administrator opens the URL on the registrar's web UI,
-  logs in with OIDC and approves it (or runs
-  `htc-registration approve CODE NAME` on the registrar), and the CE collects
-  the token by polling. The token is an access token: renewal uses a refresh
-  secret, which outlives it. A CE whose token expired (it was down, or the
-  registrar was unreachable) renews with the secret; only a revoked
-  registration, a refresh secret idle for `REFRESH_IDLE_LIFETIME`, a
-  registration older than `MAX_REGISTRATION_AGE`, or an approver who is no
-  longer authorized needs a person. The secret rotates in two phases
-  (current / pending) and survives a crash at any point. A superseded secret
-  that shows up again (retired, or a pending secret replaced by a renewal with
-  the current one) revokes the registration, as do more than `MAX_REISSUES`
-  renewals in a row with the current secret: both mean a copy of the CE's
-  state is in use.
+### Approval mode
 
-`auto` (the default) tries callback when an SSL server credential is available,
-and falls back to approval.
+```mermaid
+sequenceDiagram
+    participant CE
+    participant R as Registrar
+    actor A as Administrator in a browser
+    participant I as Identity provider
+    participant C as CE-Collector
+    CE->>R: Request a token for ce.example.edu
+    R-->>CE: Approval URL and code
+    Note over CE: htc-registration status and the<br/>CE log show the URL and code
+    A->>R: Open the approval URL
+    R->>A: Send the browser to sign in
+    A->>I: Sign in
+    I-->>A: Return to the registrar
+    A->>R: Check the CE name and code, then approve
+    CE->>R: Ask whether the request was approved
+    R-->>CE: Token for ce.example.edu
+    Note over CE: The CE installs the token in<br/>/etc/condor-ce/tokens.d
+    CE->>C: Advertise the Scheduler ad with the token
+    Note over CE,R: The CE renews the token without another approval
+```
 
-## Build and test
+## Install
+
+Each release on [GitHub Releases](https://github.com/bbockelm/htc-registrationd/releases)
+has an RPM for x86_64 and for aarch64, and a `SHA256SUMS` file. Install the
+same package on the CEs and on the CE-Collector host:
 
 ```
-make build        # bin/htc-registrationd, bin/htc-registration -> htc-registrationd
+VERSION=0.1.0     # the release to install
+ARCH=$(uname -m)  # x86_64 or aarch64
+dnf install https://github.com/bbockelm/htc-registrationd/releases/download/v${VERSION}/htc-registrationd-${VERSION}-1.${ARCH}.rpm
+```
+
+To check the download first:
+
+```
+URL=https://github.com/bbockelm/htc-registrationd/releases/download/v${VERSION}
+curl -LO ${URL}/htc-registrationd-${VERSION}-1.${ARCH}.rpm
+curl -LO ${URL}/SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
+dnf install ./htc-registrationd-${VERSION}-1.${ARCH}.rpm
+```
+
+The RPM requires HTCondor (the `condor` package). It installs:
+
+| Path | What it is |
+|---|---|
+| `/usr/sbin/htc-registrationd` | the daemon |
+| `/usr/bin/htc-registration` | the command-line tool (a link to the daemon) |
+| `/etc/condor-ce/config.d/50-htc-registrationd-ce.conf` | configuration for a CE |
+| `/etc/condor-ce/config.d/50-htc-registrationd-registrar.conf` | configuration for the CE-Collector |
+| `/usr/share/doc/htc-registrationd/` | this README and [protocol.md](docs/protocol.md) |
+
+Installing or upgrading the RPM starts nothing. Every line that starts the
+daemon is commented out in both configuration files; you enable it in one of
+them. Both files are `%config(noreplace)`, so your edits survive an
+upgrade.
+
+## Configure a CE
+
+Before you start:
+
+- The CE already advertises to the CE-Collector: `CONDOR_VIEW_HOST` names
+  it, for example `collector.example.org:9619`. The CE finds the registrar
+  there.
+- The registrar is running on that CE-Collector, and its administrator has
+  authorized your CE's name (see [Configure the CE-Collector](#configure-the-ce-collector)).
+
+In `/etc/condor-ce/config.d/50-htc-registrationd-ce.conf`, uncomment the
+two lines under `enable`:
+
+```
+DAEMON_LIST            = $(DAEMON_LIST) HTC_REGISTRATIOND
+HTC_REGISTRATIOND_MODE = ce
+```
+
+The rest of that file is already set: it makes the daemon a DaemonCore
+daemon under the master (`DC_DAEMON_LIST`, `HTC_REGISTRATIOND_ARGS = -sock htc_registrationd`),
+sets its log, and adds its state directory to `VALID_SPOOL_FILES` so that
+`condor_preen` keeps it.
+
+By default (`HTC_REGISTRATIOND_METHOD = auto`), the CE uses callback mode
+when it has an SSL server certificate, and approval mode otherwise or when
+the callback fails. To choose one mode, add one of the settings below to a
+file of your own, such as `/etc/condor-ce/config.d/60-htc-registrationd.conf`.
+
+### A CE with a host certificate (callback mode)
+
+```
+HTC_REGISTRATIOND_METHOD = callback
+```
+
+For callback mode:
+
+- The certificate in `AUTH_SSL_SERVER_CERTFILE` (HTCondor-CE's default
+  includes `/etc/grid-security/hostcert.pem`) must name the CE, and be issued
+  by a CA the registrar trusts. Let's Encrypt certificates work.
+- The CE-Collector host must be able to connect to the CE's HTCondor-CE port
+  (9619), which is open on a CE that accepts jobs from outside.
+- The CE's address must be public: the registrar does not connect to
+  private, loopback or link-local addresses unless its administrator allows
+  them.
+
+### A CE without a host certificate (approval mode)
+
+```
+HTC_REGISTRATIOND_METHOD = approval
+```
+
+The CE needs only to reach the CE-Collector on port 9619, as it already
+does to advertise.
+
+### Start it
+
+```
+systemctl restart condor-ce
+htc-registration status
+```
+
+In callback mode, `State` becomes `registered` within a minute. In approval
+mode, `State` is `approval-pending`, and `htc-registration status` shows an
+approval URL and a code; the URL is also in the daemon's log
+(`/var/log/condor-ce/HtcRegistrationdLog`) and in
+`/var/lib/condor-ce/spool/htc-registrationd/approval-url`. Send the URL to
+an administrator of the registrar, or open it yourself if you are allowed to
+approve this CE. The code expires after 30 minutes; the CE then starts a new
+request with a new code.
+
+Once the token is installed, the daemon reconfigures the CE and checks the
+token against `CONDOR_VIEW_HOST`. `htc-registration status` shows the result
+as `View host check`.
+
+The CE's name is the name its schedd advertises: `SCHEDD_NAME` if set, else
+the host's full name. The token is issued for that name, and the
+CE-Collector accepts a Scheduler ad only when its `Name` matches.
+
+## Configure the CE-Collector
+
+The registrar runs under the CE-Collector's `condor_ce_master` on the same
+host, behind the collector's shared port, so CEs reach it at
+`<collector.example.org:9619?sock=htc_registrationd>` without extra
+configuration. It signs tokens with a key it creates in
+`/etc/condor-ce/passwords.d/ce-registration`, which the collector on the
+same host reads to accept them.
+
+In `/etc/condor-ce/config.d/50-htc-registrationd-registrar.conf`, uncomment
+the three lines under `enable`:
+
+```
+DAEMON_LIST            = $(DAEMON_LIST) HTC_REGISTRATIOND
+HTC_REGISTRATIOND_MODE = registrar
+COLLECTOR.SEC_ADVERTISE_SCHEDD_AUTHENTICATION_METHODS = TOKEN, SSL
+```
+
+The third line lets the collector accept the tokens. HTCondor-CE's default
+for advertising a schedd is SSL only.
+
+With HTCondor-CE's defaults, a CE's token identity is
+`ce.example.edu@users.htcondor.org` (the CE name at `UID_DOMAIN`), which the
+CE-Collector's `ALLOW_ADVERTISE_SCHEDD` already allows. The registrar does
+not start if `TRUST_DOMAIN` is empty; HTCondor sets it to `$(UID_DOMAIN)` by
+default.
+
+Then add the authorization settings below to a file of your own, such as
+`/etc/condor-ce/config.d/60-htc-registrationd.conf`, and run
+`systemctl restart condor-ce-collector`.
+
+### Authorization with a map file
+
+```
+HTC_REGISTRATIOND_AUTHZ         = mapfile
+HTC_REGISTRATIOND_AUTHZ_MAPFILE = /etc/condor-ce/htc-registrationd.map
+
+# The web UI, for approval mode
+HTC_REGISTRATIOND_HTTPS_ADDR     = :443
+HTC_REGISTRATIOND_HTTPS_CERTFILE = /etc/grid-security/hostcert.pem
+HTC_REGISTRATIOND_HTTPS_KEYFILE  = /etc/grid-security/hostkey.pem
+HTC_REGISTRATIOND_PUBLIC_URL     = https://collector.example.org
+HTC_REGISTRATIOND_OIDC_ISSUER    = https://cilogon.org
+HTC_REGISTRATIOND_OIDC_CLIENT_ID = cilogon:/client_id/0123456789abcdef
+HTC_REGISTRATIOND_OIDC_CLIENT_SECRET_FILE = /etc/condor-ce/htc-registrationd-oidc-secret
+HTC_REGISTRATIOND_ADMINS         = http://cilogon.org/serverA/users/1234
+```
+
+`/etc/condor-ce/htc-registrationd.map`:
+
+```
+# OIDC  user (the OIDC "sub" value)              CE names the user may approve
+OIDC    http://cilogon.org/serverA/users/5678    ce1.example.edu,ce2.example.edu
+OIDC    http://cilogon.org/serverA/users/9012    ce3.example.edu
+```
+
+Each line lets one user approve the listed CEs in approval mode. A CE name
+written out on any line may also register in callback mode; a CE that is in
+no line is refused. Users are named by the identity provider's `sub` claim,
+without the issuer. The registrar re-reads the file when it changes. See
+[Map file format](#map-file-format) for patterns.
+
+Register `https://collector.example.org/oidc/callback` (your `PUBLIC_URL`
+followed by `/oidc/callback`) as the redirect URI of the OIDC client. The
+client secret file and the TLS key may be readable by root only.
+
+`ADMINS` may approve any CE, and see and revoke every registration. To find
+a user's identifier, have the user sign in to the web UI: the page footer
+shows it.
+
+If every CE uses callback mode, leave out the web UI settings.
+
+<!-- SHARED-PORT-WEB-UI: reconcile with the sharedport-http-root-ci branch. When the registrar can serve its web UI through the collector's shared port, add: "The web UI is served on the collector's shared port (e.g. https://collector.example.org:9619) when SHARED_PORT_HTTP_FORWARDING_ID = htc_registrationd; a separate HTC_REGISTRATIOND_HTTPS_ADDR listener is optional." -->
+The web UI needs its own listener. `HTC_REGISTRATIOND_HTTPS_ADDR` serves
+HTTPS directly. To run it behind a reverse proxy that terminates TLS, set
+`HTC_REGISTRATIOND_HTTP_ADDR = 127.0.0.1:8080` instead of the three `HTTPS_`
+settings, and point the proxy at it.
+
+### Authorization with OSG Topology
+
+```
+HTC_REGISTRATIOND_AUTHZ                = topology
+HTC_REGISTRATIOND_OIDC_PRINCIPAL_CLAIM = osgid
+HTC_REGISTRATIOND_OIDC_SCOPES          = openid email profile org.cilogon.userinfo
+HTC_REGISTRATIOND_ADMINS               = OSG1000001
+
+# The web UI, as in the map file example
+HTC_REGISTRATIOND_HTTPS_ADDR     = :443
+HTC_REGISTRATIOND_HTTPS_CERTFILE = /etc/grid-security/hostcert.pem
+HTC_REGISTRATIOND_HTTPS_KEYFILE  = /etc/grid-security/hostkey.pem
+HTC_REGISTRATIOND_PUBLIC_URL     = https://collector.example.org
+HTC_REGISTRATIOND_OIDC_ISSUER    = https://cilogon.org
+HTC_REGISTRATIOND_OIDC_CLIENT_ID = cilogon:/client_id/0123456789abcdef
+HTC_REGISTRATIOND_OIDC_CLIENT_SECRET_FILE = /etc/condor-ce/htc-registrationd-oidc-secret
+```
+
+A user may approve a CE when the CE's host name is an active resource with a
+CE service in [OSG Topology](https://topology.opensciencegrid.org), and the
+user's OSG ID is the `CILogonID` of one of the resource's Administrative
+Contacts (Primary, Secondary or Tertiary). Every active CE in Topology may
+register in callback mode. Users and `ADMINS` are named by their OSG ID,
+which CILogon releases as the `osgid` claim when the client asks for the
+`org.cilogon.userinfo` scope.
+
+To use both sources, set `HTC_REGISTRATIOND_AUTHZ = mapfile, topology` with
+`OIDC_PRINCIPAL_CLAIM = osgid`, and name users by OSG ID in the map file too.
+
+### Two CE-Collectors
+
+When CEs advertise to two CE-Collectors, both must accept the same tokens.
+Run the registrar on the first one (the first host in the CEs'
+`CONDOR_VIEW_HOST`). Copy its `/etc/condor-ce/passwords.d/ce-registration`
+to the same path on the second collector, owned by root with mode 0600, and
+uncomment the `COLLECTOR.SEC_ADVERTISE_SCHEDD_AUTHENTICATION_METHODS` line
+there too. Both collectors must have the same `TRUST_DOMAIN`.
+
+## Operation
+
+Run `htc-registration` as root on the host where the daemon runs. It reads
+the HTCondor-CE configuration (`/etc/condor-ce/condor_config`) unless
+`CONDOR_CONFIG` names another.
+
+### On a CE
+
+| Command | What it does |
+|---|---|
+| `htc-registration status` | shows the state, the token's expiry and next renewal, a pending approval URL and code, and the last error |
+| `htc-registration renew` | renews the token now |
+| `htc-registration request --approval` | starts a new approval request now, even in callback mode, and prints its URL and code |
+
+### On the CE-Collector
+
+| Command | What it does |
+|---|---|
+| `htc-registration list` | lists requests and registrations |
+| `htc-registration approve CODE NAME` | approves the request with that code, if it is for the CE `NAME` |
+| `htc-registration approve CODE NAME --replace` | approves a CE that already has a registration, and revokes its earlier approval-mode registrations |
+| `htc-registration deny CODE [REASON]` | denies a request |
+| `htc-registration revoke NAME [REASON]` | revokes every registration of a CE |
+| `htc-registration revoke --id ID [REASON]` | revokes one registration |
+
+In the web UI, `/approve` approves a request by its code, and
+`/registrations` lists the registrations you approved or may approve (all of
+them for `ADMINS`), with a button to revoke each.
+
+### Approving a CE
+
+The approval page shows the code, the CE name, the address the request came
+from and its reverse DNS, and when the code expires. Before you approve:
+
+- Check that the code matches the one the CE's administrator sees in
+  `htc-registration status` on the CE. A matching name is not enough: anyone
+  can request a code for any name.
+- Check that the CE name is the CE you expect, and that the address belongs
+  to it.
+
+The page says whether you are authorized for the name, and why.
+
+### Revoking a CE
+
+`htc-registration revoke NAME` (or the button in the web UI) stops the CE
+from renewing. The token it holds stays valid until it expires, at most
+`HTC_REGISTRATIOND_TOKEN_LIFETIME` (72 hours) later. A callback-mode CE
+registers again at its next attempt unless you also remove its name from
+the map file or Topology.
+
+To cut a CE off at once, add it to every CE-Collector's configuration and run
+`condor_ce_reconfig`:
+
+```
+DENY_ADVERTISE_SCHEDD = $(DENY_ADVERTISE_SCHEDD), ce.example.edu@users.htcondor.org
+```
+
+### Security notes
+
+- **Ports.** CEs connect to the CE-Collector on 9619, as they already do.
+  In callback mode, the CE-Collector host connects to each CE on 9619.
+  Approvers' browsers connect to the web UI (443 in the examples). The
+  registrar connects out to the identity provider and, with Topology, to
+  `topology.opensciencegrid.org`.
+- **Files that hold secrets.** On the CE-Collector:
+  `/etc/condor-ce/passwords.d/ce-registration` (anyone with this file can
+  make tokens the collector accepts), the OIDC client secret file, the web
+  UI's TLS key, and `/var/lib/condor-ce/spool/htc-registrationd/`. On a CE:
+  `/etc/condor-ce/tokens.d/50-htc-registration` and
+  `/var/lib/condor-ce/spool/htc-registrationd/`.
+- **Do not copy a CE's state.** If two hosts renew with the same copy of
+  `/var/lib/condor-ce/spool/htc-registrationd/`, for example a cloned VM or
+  a restored backup, the registrar revokes the registration and the CE
+  needs a new approval.
+- **Approvals.** Approve only a code you have confirmed with the CE's
+  administrator (see [Approving a CE](#approving-a-ce)).
+
+### Troubleshooting
+
+| What you see | What to do |
+|---|---|
+| The registrar log says `TRUST_DOMAIN is not set` | Set `TRUST_DOMAIN` (HTCondor's default is `$(UID_DOMAIN)`). |
+| The log warns `not listening on the shared-port endpoint named by -sock` | `HTC_REGISTRATIOND` is missing from `DC_DAEMON_LIST`. The shipped file sets it; check that a later file does not replace `DC_DAEMON_LIST`. |
+| The log warns that `VALID_SPOOL_FILES does not cover htc-registrationd` | Add `VALID_SPOOL_FILES = $(VALID_SPOOL_FILES) htc-registrationd`, as the shipped files do. |
+| The registrar log warns that callback registrations will be refused | Set `HTC_REGISTRATIOND_AUTHZ`. |
+| A callback-mode CE is refused because its name is not known | Write the CE's name out in the map file, or list the CE in Topology. |
+| A CE logs `callback registration failed; falling back to approval mode` | The registrar could not reach the CE on 9619, or the CE's certificate does not name the CE or is not from a CA the registrar trusts, or the CE's address is private. |
+| `View host check` in `htc-registration status` failed | On the CE-Collector, check the `COLLECTOR.SEC_ADVERTISE_SCHEDD_AUTHENTICATION_METHODS` line. With two collectors, check the key copy and `TRUST_DOMAIN`. |
+| The collector rejects the CE's Scheduler ad | The ad's `Name` must be the registered name. Do not set `SCHEDD_NAME` to a name other than the host's, or set `HTC_REGISTRATIOND_NAME` to the name the schedd advertises. |
+| The web page says you are not authorized | Add the identifier in the page footer to the map file or `ADMINS`, or to the resource's contacts in Topology. |
+| The web page says you signed in through a provider this registrar does not use | Sign in with the identity provider the registrar is configured for (`OIDC_ISSUER`). |
+| A CE logs that the registrar no longer accepts the administrator who approved it | The approver lost authorization for the CE. Approve the CE again (`htc-registration request --approval` on the CE). |
+| `htc-registration` says `no -addr and no readable address file` | Run it as root on the host where the daemon runs, with the HTCondor-CE configuration. |
+
+## Configuration reference
+
+All knobs live in the HTCondor-CE configuration. Durations are seconds, or
+values such as `30m`, `72h`.
+
+### Both roles
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `HTC_REGISTRATIOND_MODE` | none | `ce` or `registrar` |
+| `HTC_REGISTRATIOND_STATE_DIR` | `$(SPOOL)/htc-registrationd` | where the daemon keeps its state |
+| `HTC_REGISTRATIOND_ARGS` | `-sock htc_registrationd` (shipped) | names the daemon's shared-port endpoint |
+| `HTC_REGISTRATIOND_LOG` | `$(LOG)/HtcRegistrationdLog` (shipped) | log file |
+| `HTC_REGISTRATIOND_DEBUG` | none | log detail, such as `general:debug cedar:info` |
+| `HTC_REGISTRATIOND_ADDRESS_FILE` | `$(LOG)/.htc_registrationd_address` | where `htc-registration` finds the daemon |
+
+### CE
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `HTC_REGISTRATIOND_METHOD` | `auto` | `callback`, `approval`, or `auto` (callback when an SSL server certificate is configured, else approval) |
+| `HTC_REGISTRATIOND_NAME` | the schedd's name | the CE name to register; must equal the Scheduler ad's `Name` |
+| `HTC_REGISTRATIOND_REGISTRAR` | first `CONDOR_VIEW_HOST`, `?sock=htc_registrationd` | the registrar's address |
+| `HTC_REGISTRATIOND_REGISTRAR_NAME` | the host in the registrar's address | the name the registrar's certificate must carry |
+| `HTC_REGISTRATIOND_CALLBACK_ADDRESS` | the daemon's shared-port address | where the registrar connects back in callback mode |
+| `HTC_REGISTRATIOND_TOKEN_FILE` | `$(SEC_TOKEN_SYSTEM_DIRECTORY)/50-htc-registration` | where the token is installed; `SEC_TOKEN_DIRECTORY` is used instead when set |
+
+### Registrar
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `HTC_REGISTRATIOND_SIGNING_KEY` | `ce-registration` | signing key file in `SEC_PASSWORD_DIRECTORY`, created if missing; `POOL` means the pool key |
+| `HTC_REGISTRATIOND_IDENTITY_DOMAIN` | `$(UID_DOMAIN)` | the token identity is `<CE name>@<this>` |
+| `HTC_REGISTRATIOND_TOKEN_LIFETIME` | `72h` | lifetime of each token |
+| `HTC_REGISTRATIOND_TOKEN_LIMITS` | `ADVERTISE_SCHEDD` | authorizations the token allows |
+| `HTC_REGISTRATIOND_CALLBACK_NAMES` | `authz` | `authz`: callback mode only for names the authorization source knows; `any`: any name with a trusted certificate |
+| `HTC_REGISTRATIOND_CALLBACK_ALLOW_NETWORKS` | none | CIDRs of private networks the registrar may connect back to |
+| `HTC_REGISTRATIOND_VERIFICATION_URI` | `$(HTC_REGISTRATIOND_PUBLIC_URL)/approve` | approval URL sent to CEs; `https://$(FULL_HOSTNAME)/approve` without a web UI |
+| `HTC_REGISTRATIOND_RECHECK_APPROVER` | `true` | at each renewal, the web UI approver must still be authorized for the CE |
+| `HTC_REGISTRATIOND_REFRESH_IDLE_LIFETIME` | `720h` | an approval-mode CE that has not renewed for this long needs a new approval |
+| `HTC_REGISTRATIOND_MAX_REGISTRATION_AGE` | no limit | an approval-mode registration this old needs a new approval |
+
+The issuer of the tokens is `TRUST_DOMAIN`, which must be the same on every
+CE-Collector that accepts them.
+
+### Web UI and login
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `HTC_REGISTRATIOND_HTTPS_ADDR` | none | HTTPS listener, such as `:443` |
+| `HTC_REGISTRATIOND_HTTPS_CERTFILE` | none | certificate for the HTTPS listener; re-read when it changes |
+| `HTC_REGISTRATIOND_HTTPS_KEYFILE` | none | key for the HTTPS listener; may be readable by root only |
+| `HTC_REGISTRATIOND_HTTP_ADDR` | none | plain HTTP listener on a loopback address, for a reverse proxy |
+| `HTC_REGISTRATIOND_TRUSTED_PROXIES` | `127.0.0.1, ::1` | proxies whose `X-Forwarded-For` is used for rate limits |
+| `HTC_REGISTRATIOND_PUBLIC_URL` | none; required | the `https://` origin browsers and CEs use, with no path |
+| `HTC_REGISTRATIOND_OIDC_ISSUER` | none; required | the identity provider's issuer URL |
+| `HTC_REGISTRATIOND_OIDC_CLIENT_ID` | none; required | the OIDC client ID |
+| `HTC_REGISTRATIOND_OIDC_CLIENT_SECRET_FILE` | none | file holding the client secret; may be readable by root only |
+| `HTC_REGISTRATIOND_OIDC_SCOPES` | `openid email profile` | scopes to request |
+| `HTC_REGISTRATIOND_OIDC_PRINCIPAL_CLAIM` | `sub` | the claim that names a user; `osgid` for Topology; never `email` |
+| `HTC_REGISTRATIOND_ADMINS` | none | users who may approve any CE and manage every registration |
+
+The web UI is enabled when `HTTPS_ADDR` or `HTTP_ADDR` is set. Register
+`<PUBLIC_URL>/oidc/callback` as the client's redirect URI.
+
+### Authorization
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `HTC_REGISTRATIOND_AUTHZ` | none | `mapfile`, `topology`, or both |
+| `HTC_REGISTRATIOND_AUTHZ_MAPFILE` | none | the map file, when `AUTHZ` includes `mapfile` |
+| `HTC_REGISTRATIOND_TOPOLOGY_URL` | `https://topology.opensciencegrid.org` | OSG Topology server |
+| `HTC_REGISTRATIOND_TOPOLOGY_INCLUDE_ITB` | `false` | also accept ITB resources |
+
+### Map file format
+
+The map file is an HTCondor map file. Only lines of method `OIDC` are used:
+
+```
+# method  user (literal, or /regex/)                 CE names
+OIDC      http://cilogon.org/serverA/users/1234      ce1.example.edu,*.grid.example.edu
+OIDC      /^ops-[0-9]+$/                             ce2.example.edu
+```
+
+- A user is named by the value of `OIDC_PRINCIPAL_CLAIM`: the bare `sub`,
+  without the issuer, by default.
+- A CE name is literal, or a glob in which `*` also matches dots. Names
+  compare without regard to case. Only literal names allow callback mode.
+- As in any HTCondor map file, only the first line that matches a user is
+  used, so put all of a user's names on one line.
+- A regular expression is written between slashes, with `/` inside it
+  written `\/`. It matches anywhere in the user, so anchor it with `^` and
+  `$`. `\1` through `\9` in the CE names are replaced by its groups.
+
+### Tuning
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `HTC_REGISTRATIOND_CONNECT_TIMEOUT` | `30s` | CE: connecting to the registrar |
+| `HTC_REGISTRATIOND_CALLBACK_WAIT` | `90s` | CE: waiting for the registrar to connect back |
+| `HTC_REGISTRATIOND_CALLBACK_CONNECT_TIMEOUT` | `10s` | registrar: connecting back to a CE |
+| `HTC_REGISTRATIOND_CALLBACK_TIMEOUT` | `30s` | registrar: the whole callback |
+| `HTC_REGISTRATIOND_APPROVAL_TTL` | `30m` | how long a code may wait for approval |
+| `HTC_REGISTRATIOND_UNCLAIMED_TTL` | `24h` | how long an approved request waits for the CE to collect it |
+| `HTC_REGISTRATIOND_POLL_INTERVAL` | `5s` | how often a waiting CE asks |
+| `HTC_REGISTRATIOND_MAX_PENDING_PER_IP` | `10` | open requests per source network |
+| `HTC_REGISTRATIOND_MAX_PENDING` | `1000` | open requests in total |
+| `HTC_REGISTRATIOND_MAX_REISSUES` | `5` | repeated renewals that revoke a registration |
+| `HTC_REGISTRATIOND_SESSION_IDLE` | `1h` | web UI sign-out after inactivity |
+| `HTC_REGISTRATIOND_SESSION_LIFETIME` | `12h` | web UI sign-out after this long |
+| `HTC_REGISTRATIOND_TOPOLOGY_REFRESH` | `15m` | how often Topology is read |
+| `HTC_REGISTRATIOND_TOPOLOGY_MAX_STALE` | `24h` | how long a copy of Topology is used when reads fail |
+
+The daemon also reads these HTCondor knobs: `TRUST_DOMAIN`, `UID_DOMAIN`,
+`SEC_PASSWORD_DIRECTORY`, `SEC_TOKEN_SYSTEM_DIRECTORY`,
+`SEC_TOKEN_DIRECTORY`, `CONDOR_VIEW_HOST`, `SCHEDD_NAME`, `SPOOL`,
+`AUTH_SSL_SERVER_CERTFILE` and `AUTH_SSL_SERVER_KEYFILE`, and the CA
+settings `AUTH_SSL_CLIENT_CAFILE`, `AUTH_SSL_CLIENT_CADIR` and
+`AUTH_SSL_CLIENT_USE_DEFAULT_CAS` (default true: the system trust store is
+trusted too) and their `AUTH_SSL_SERVER_*` counterparts.
+
+`condor_ce_reconfig` applies most changes; [protocol.md](docs/protocol.md#reconfiguration)
+lists the knobs that take a restart.
+
+## Development
+
+```
+make build        # bin/htc-registrationd and bin/htc-registration
 make test         # go test ./...
 make test-race
 make vet lint
-make rpm          # dist/htc-registrationd-*.rpm (needs nfpm)
+make rpm          # dist/htc-registrationd-*.rpm; PKG_ARCH=amd64|arm64, needs nfpm
 ```
 
-The RPM installs `/usr/sbin/htc-registrationd`, the `/usr/bin/htc-registration`
-symlink, and two configuration files in `/etc/condor-ce/config.d/`:
-`50-htc-registrationd-ce.conf` for a CE and
-`50-htc-registrationd-registrar.conf` for the CE-Collector. Installing it
-starts nothing: enable the daemon by uncommenting the `DAEMON_LIST` and
-`HTC_REGISTRATIOND_MODE` lines in one of the two.
+[docs/protocol.md](docs/protocol.md) describes the CEDAR commands, the two
+exchanges, renewal, and the registrar's checks.
 
-## Demo
+### Demo
 
-`make demo` runs the whole system on one machine (macOS or Linux) as the
-current user, with no root and no system changes:
-
-- a registrar, with its web UI at `http://localhost:<port>`;
-- an OpenID provider whose login page offers four identities: `alice` may
-  approve `ce2.localhost`, `bob` may approve `ce1.localhost`, `admin` is a
-  registrar administrator, and `mallory` may approve nothing;
-- `ce1.localhost`, in callback mode, which registers by itself;
-- `ce2.localhost`, in approval mode, which waits for someone to approve it in
-  the web UI;
-- when HTCondor is installed (`condor_collector` on `PATH`, or `CONDOR_BIN`
-  naming its `sbin` directory), a `condor_collector` set up as an
-  HTCondor-CE CE-Collector: it verifies tokens with the registrar's signing
-  key and enforces HTCondor-CE's `COLLECTOR_REQUIREMENTS`, so a Scheduler ad's
-  `Name` must be the CE name its token authenticates. The demo advertises
-  each CE's Scheduler ad with the CE's token, and an ad that claims
-  `ce2.localhost` with ce1's token, which the collector rejects.
-
-When everything is up, the demo prints the URLs, ce2's approval URL and the
-commands to try, then streams every process's log. Ctrl-C stops it.
+`make demo` runs a registrar, an OpenID provider, and two CEs on one
+machine (macOS or Linux) as the current user, with state in `.demo/`.
+`ce1.localhost` registers in callback mode; `ce2.localhost` waits for
+approval in the web UI. The provider offers four users: `alice` may approve
+ce2, `bob` may approve ce1, `admin` is a registrar administrator, and
+`mallory` may approve nothing. When HTCondor is installed
+(`condor_collector` on `PATH`, or `CONDOR_BIN` naming its `sbin`
+directory), the demo also runs a collector configured as a CE-Collector, and
+checks that it accepts each CE's ad and rejects an ad that claims another
+CE's name.
 
 ```
 make demo                              # start; Ctrl-C stops
 make demo-status                       # both CEs' state and the registrar's list
-make demo-revoke NAME=ce1.localhost    # revoke a registration
-make demo-renew CE=ce1                 # renew a CE's token now
-make demo-request CE=ce1               # start an approval request on a CE
-make demo-approve CODE=XXXX-XXXX NAME=ce2.localhost  # approve on the command line
+make demo-revoke NAME=ce1.localhost
+make demo-renew CE=ce1
+make demo-request CE=ce1               # start an approval request
+make demo-approve CODE=XXXX-XXXX NAME=ce2.localhost
 make demo-advertise CE=ce1 NAME=ce2.localhost  # advertise with a CE's token
-make demo-clean                        # remove all demo state
-CONDOR_BIN=/path/to/release_dir/sbin make demo   # use this HTCondor
+make demo-clean                        # remove .demo/
 ```
 
-All state is in `.demo/`: a throw-away CA and certificates, each daemon's
-`condor_config`, logs and spool, the signing key, and the installed tokens.
-It survives a restart; `make demo-clean` removes it. While the demo runs,
-`.demo/ready.json` lists its URLs, files and ce2's approval code. The `*.localhost` names
-resolve to loopback without configuration (RFC 6761), and certificates are
-still verified against them. Ports are chosen once, between 20000 and 30000,
-and kept in `.demo/ports.json`.
+`go test ./internal/demo/...` runs the demo headless.
 
-The daemons run without a master, each listening on its own port. The demo
-answers each CE's `DC_RECONFIG_FULL` in the master's place, and then
-advertises that CE's Scheduler ad with the new token.
+### Browser tests
 
-`go test ./internal/demo/...` runs the demo headless, approves ce2 through
-the web UI and the identity provider as a browser would, and checks that
-both CEs install tokens the registrar's key verifies, and, with HTCondor
-installed, what the collector accepts.
-
-`make e2e` does the same in real browsers, by clicking through the pages
-([Playwright](https://playwright.dev), under `e2e/`; needs Node.js 20 or
-newer): mallory refused, alice approving ce2 and ce2 installing its token, a
-typed subject, Cancel at the identity provider, the code form, a session
-that ends while the code form is open, and admin revoking ce1. Each browser
-gets a demo of its own, with no HTCondor collector unless `CONDOR_BIN` is
-set.
+`make e2e` drives the demo through the web UI in real browsers, with
+[Playwright](https://playwright.dev) (under `e2e/`, Node.js 20 or newer).
 
 ```
 make e2e                                   # Chromium
 make e2e E2E_BROWSERS="chromium webkit firefox"
-cd e2e && E2E_DEMO_DIR=.demo npx playwright test   # drive a fresh make demo
+cd e2e && E2E_DEMO_DIR=.demo npx playwright test   # against a running make demo
 ```
 
-## Running under the master
+### Releases
 
-The daemon must be a DaemonCore daemon to the master
-(`DC_DAEMON_LIST = $(DC_DAEMON_LIST) +HTC_REGISTRATIOND`), so the master hands
-it a shared-port endpoint. The master names that endpoint after the `-sock`
-argument in `HTC_REGISTRATIOND_ARGS`; without one the name carries the
-master's pid and a random tag and changes on every restart. Both shipped
-configurations set `HTC_REGISTRATIOND_ARGS = -sock htc_registrationd`, so the
-registrar is always at `<collector-host:port?sock=htc_registrationd>`.
-
-The end-to-end tests in `internal/ce` run a registrar and a CE as two cedar
-servers on loopback, using a generated test CA.
-
-## Command numbers
-
-77000-77013, defined in `internal/protocol`:
-
-| Command | Number | Served by | Level |
-|---|---|---|---|
-| `REG_REQUEST` | 77000 | registrar | ALLOW, SSL + encryption |
-| `REG_POLL` | 77001 | registrar | ALLOW, SSL + encryption |
-| `REG_RENEW` | 77002 | registrar | ALLOW, SSL + encryption |
-| `REG_CALLBACK` | 77003 | CE | ALLOW, SSL + encryption |
-| `REG_STATUS` | 77004 | CE | READ |
-| `REG_RENEW_NOW` | 77005 | CE | ADMINISTRATOR |
-| `REG_REQUEST_APPROVAL` | 77006 | CE | ADMINISTRATOR |
-| `REG_ADMIN_LIST` / `APPROVE` / `DENY` / `REVOKE` | 77010-77013 | registrar | ADMINISTRATOR + encryption |
-
-## Configuration
-
-All knobs are `HTC_REGISTRATIOND_*`. Durations are seconds, or Go durations
-such as `72h`.
-
-Both modes:
-
-- `MODE`: `ce` or `registrar` (or `-mode`).
-- `STATE_DIR`: default `$(SPOOL)/htc-registrationd`. Add `htc-registrationd`
-  to `VALID_SPOOL_FILES` so that `condor_preen` keeps it. The daemon warns at
-  startup if it is missing.
-
-CE:
-
-- `NAME`: default: the name the schedd advertises, which is
-  `$(FULL_HOSTNAME)`, or `SCHEDD_NAME` made a daemon name as the schedd makes
-  it (a name that is not this host's becomes `name@$(FULL_HOSTNAME)`, which no
-  token can match). Must equal the Scheduler ad's `Name`. Names are
-  lower-cased; the registrar compares them without regard to case.
-- `METHOD`: `auto` | `callback` | `approval` (default `auto`).
-- `REGISTRAR`: the registrar's address. Default: the host:port of the first
-  `CONDOR_VIEW_HOST` entry (`COLLECTOR_PORT` when it names no port) with
-  `sock=htc_registrationd`, e.g.
-  `<collector.example.org:9619?sock=htc_registrationd>`. That is where a
-  registrar running behind the CE-Collector's shared port listens, so a CE
-  that already advertises to its CE-Collector needs no extra configuration.
-- `REGISTRAR_NAME`: the name its certificate must carry. By default this is
-  derived from the address.
-- `CALLBACK_ADDRESS`: default: the daemon's shared-port sinful.
-- `TOKEN_FILE`: default `50-htc-registration` in `SEC_TOKEN_DIRECTORY` when
-  that is set, else in `SEC_TOKEN_SYSTEM_DIRECTORY`: the directory the CE's
-  daemons read tokens from.
-  The daemon runs as condor and writes the file itself, so the directory must
-  be writable by condor. On an HTCondor-CE it is `/etc/condor-ce/tokens.d`,
-  which the CE package creates owned by condor, mode 0700.
-- `CONNECT_TIMEOUT` / `CALLBACK_WAIT`: default 30 s / 90 s: connecting to
-  the registrar, and waiting for its callback.
-
-`condor_reconfig` re-reads `METHOD`, `REGISTRAR`, `REGISTRAR_NAME`,
-`CALLBACK_ADDRESS`, the token directory, the timeouts, `CONDOR_VIEW_HOST` and
-the `AUTH_SSL_*` CA knobs. A changed token directory gets a token at once.
-
-Registrar:
-
-- `SIGNING_KEY`: default `ce-registration`, the name of the signing key file
-  in `SEC_PASSWORD_DIRECTORY` (`POOL` means the pool key, read from
-  `SEC_TOKEN_POOL_SIGNING_KEY_FILE` as HTCondor reads it). As HTCondor
-  requires, the file must be owned by the daemon's real uid (root under a
-  root master) and not be readable by group or others. When the file does not exist, the registrar
-  creates it at startup and on every reconfig, as an HTCondor collector
-  creates its own signing key: 64 random bytes, root-owned, mode 0600, in
-  HTCondor's format. An existing file is never replaced. The collector on the
-  same host reads the same file and so accepts the tokens. With two central
-  collectors, copy the key file to the other one's `SEC_PASSWORD_DIRECTORY`
-  (root-owned, mode 0600) and set the same `TRUST_DOMAIN` on both, so a token
-  works on either. If a registrar there already created its own key, replace
-  that file with the copy.
-- `IDENTITY_DOMAIN`: default `$(UID_DOMAIN)`. The issuer is `TRUST_DOMAIN`
-  (HTCondor's default, `$(UID_DOMAIN)`, applies when it is unset); the
-  registrar does not start if it is empty.
-- `TOKEN_LIMITS`: default `ADVERTISE_SCHEDD`.
-- `TOKEN_LIFETIME`: default 72 h.
-- `CALLBACK_NAMES`: `authz` | `any` (default `authz`: the name must be known
-  to an `AUTHZ` backend; with no backend every callback is refused).
-- `CALLBACK_ALLOW_NETWORKS`: CIDRs re-allowed for callbacks. Loopback, RFC
-  1918, CGNAT, link-local, multicast, ULA, the documentation, benchmarking
-  and IETF special-purpose ranges, the Azure WireServer address, their
-  IPv4-mapped / SIIT / NAT64 / 6to4 forms, and the registrar's own addresses
-  are denied by default. The check
-  runs at connect time on each address the callback actually dials, after
-  the CE's host name is resolved.
-- `CALLBACK_CONNECT_TIMEOUT` / `CALLBACK_TIMEOUT`: default 10 s / 30 s. A
-  failed callback backs off further callbacks for that name from that
-  network (an IPv6 /64 or an IPv4 address) only; a success clears the
-  name's back-off. A requester learns that a callback failed, never how.
-- `MAX_PENDING_PER_IP` / `MAX_PENDING`: default 10 / 1000: live requests per
-  network (an IPv6 /64, an IPv4 address) and in total.
-- `APPROVAL_TTL` (30 min), `UNCLAIMED_TTL` (24 h), `POLL_INTERVAL` (5 s).
-- `VERIFICATION_URI`: default `$(HTC_REGISTRATIOND_PUBLIC_URL)/approve` when
-  the web UI is configured, else `https://$(FULL_HOSTNAME)/approve`. A CE is
-  sent this and `<VERIFICATION_URI>?code=XXXX-XXXX`.
-- `RECHECK_APPROVER` (true): at each approval-mode renewal, the person who
-  approved the registration in the web UI must still be authorized for the
-  name (an administrator, or allowed by an `AUTHZ` backend). Approvals made
-  with `htc-registration approve` (CEDAR `ADMINISTRATOR`) are not re-checked.
-- `MAX_REGISTRATION_AGE` (no cap).
-- `REFRESH_IDLE_LIFETIME` (30 days): a refresh secret not used for this long
-  no longer renews.
-- `MAX_REISSUES` (5): renewals in a row with the current refresh secret (the
-  pending one never proven) before the registration is revoked. An honest CE
-  does this only when it loses the reply to every one of them.
-
-`condor_reconfig` re-reads every registrar knob above except `SIGNING_KEY`,
-`IDENTITY_DOMAIN`, `TOKEN_LIMITS`, `TOKEN_LIFETIME`, `CALLBACK_NAMES` and
-`CALLBACK_ALLOW_NETWORKS`, which take a restart.
-
-Certificate trust uses the standard HTCondor knobs: `AUTH_SSL_CLIENT_CAFILE`,
-`AUTH_SSL_CLIENT_CADIR` and `AUTH_SSL_CLIENT_USE_DEFAULT_CAS` (default true:
-the system trust store is trusted too) for the connections the daemon makes,
-the CE's to the registrar and the registrar's callbacks, and the
-`AUTH_SSL_SERVER_*` variants for the connections it accepts.
-
-### Web UI (registrar)
-
-The registrar serves an approval page when a listener is configured. Login is
-OpenID Connect (authorization code with PKCE, identity from the provider's
-userinfo endpoint), done by the daemon itself; headers from a proxy are never
-used as identity.
-
-- `HTTPS_ADDR`, with `HTTPS_CERTFILE` and `HTTPS_KEYFILE`: the HTTPS listener,
-  e.g. `:443`. The key may be root-only. A renewed certificate is picked up
-  within a minute, and on `condor_reconfig`.
-- `HTTP_ADDR`: a plain-HTTP listener on a loopback address (e.g.
-  `127.0.0.1:8080`) for a reverse proxy that terminates TLS. The proxy must
-  set `X-Forwarded-For`; on this listener, for connections from a trusted
-  proxy, its nearest entry that is not a trusted proxy is the address
-  requests are rate-limited by. It is used for nothing else.
-- `TRUSTED_PROXIES`: addresses or CIDR prefixes of those proxies; default
-  `127.0.0.1, ::1`.
-- `PUBLIC_URL`: required; the `https://` origin browsers and CEs use, with no
-  path (`http://` only for a loopback host). It is used in lower case and
-  without a default port (`:443`). A sign-in that reaches the UI under
-  another host name is sent to this one first.
-- `OIDC_ISSUER`: the provider's issuer URL, read via
-  `/.well-known/openid-configuration`. Register `<PUBLIC_URL>/oidc/callback`,
-  in that form, as the client's redirect URI.
-- `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET_FILE` (may be root-only; re-read on
-  reconfig).
-- `OIDC_SCOPES`: default `openid email profile`. CILogon needs
-  `openid email profile org.cilogon.userinfo` to release `osgid`.
-- `OIDC_PRINCIPAL_CLAIM`: default `sub`. Configuration (`ADMINS`, the
-  mapfile) names a user by this claim's value. With `sub`, the registrar
-  records a user as `<issuer>,<sub>`, and a recorded user matches
-  configuration only while `OIDC_ISSUER` is still that issuer. Any other
-  claim is used as its bare value, with no issuer attached and no
-  verification check, so it must be an identifier that the configured
-  provider issues and never reassigns, such as `osgid`; for OSG Topology,
-  set `osgid`. It must never be `email`, and the daemon refuses to start
-  with `email`.
-- `ADMINS`: registrar administrators, a comma- or space-separated list of
-  users by `OIDC_PRINCIPAL_CLAIM` value. They may approve any name, and see
-  and revoke every registration. Re-read on reconfig.
-- `SESSION_IDLE` (1 h), `SESSION_LIFETIME` (12 h). Sessions are kept in the
-  registrar's database; sign-ins in progress are kept in memory, so a
-  restart asks those users to sign in again.
-
-Pages: `/approve` (enter a code, or `/approve?code=XXXX-XXXX`: the request's
-CE name, code, source address and its reverse DNS, time, the version of
-htc-registrationd the CE runs, and
-whether the logged-in user may approve it and why), `/registrations` (the
-registrations the user approved or is authorized for, all of them for an
-administrator; revoking one takes current authorization for its name, or
-being an administrator), `/healthz`. Login and approve requests are
-rate-limited per client address (per /64 for IPv6).
-
-### Authorization backends (registrar)
-
-- `AUTHZ`: `mapfile`, `topology`, or both as a list. A user may approve a
-  name when any listed backend allows it (the first allow wins). A name is
-  known for callback mode (`CALLBACK_NAMES = authz`) when any backend knows
-  it. Changing the list takes a restart.
-
-**mapfile** (`AUTHZ_MAPFILE`): an HTCondor map file. Lines of method `OIDC`
-map a user, by `OIDC_PRINCIPAL_CLAIM` value, to the comma-separated CE names
-the user may approve:
-
-```
-# method  user (literal, or /regex/)                 CE names
-OIDC http://cilogon.org/serverA/users/1234          ce1.example.edu,*.grid.example.edu
-OIDC /^ops-[0-9]+$/                                 ce2.example.edu
-```
-
-A regular expression is written between slashes, so a `/` inside it is
-written `\/`. As in HTCondor, it is searched for anywhere in the user, not
-matched against the whole of it, so anchor it with `^` and `$`:
-`/ops-[0-9]+/` also matches `evil-ops-1-x`, while `/^ops-[0-9]+$/` matches
-only `ops-` and digits. `\1` through `\9` in the CE names are replaced by
-the regular expression's groups (`\0` by the whole match); a user whose
-substituted text holds a comma, `*`, `?`, `[` or `\` is allowed nothing
-by that line. A name is literal or a `path.Match` glob (`*` also matches
-dots); names compare without regard to case. As in any HTCondor map file, only the first
-line whose user matches is used, so list all of a user's names on
-that line. Only literal names are known for callback mode: a glob can approve
-names but never makes one known, since callback mode needs the name written
-out. The file is re-read when its modification time changes and on
-reconfig; a file that fails to load leaves the last good one in use, and the
-error is logged.
-
-**topology**: OSG Topology. A user may approve a name when the name is the
-FQDN of an active resource with a CE service and the user's principal (the
-`osgid` claim: set `OIDC_PRINCIPAL_CLAIM = osgid`) is the `CILogonID` of a
-contact in any of its Administrative Contact lists (Primary, Secondary or
-Tertiary). A name is known when it is an active CE's FQDN. A contact
-listed without a `CILogonID` can never approve.
-
-- `TOPOLOGY_URL`: default `https://topology.opensciencegrid.org` (https only).
-- `TOPOLOGY_INCLUDE_ITB`: default false: production resources only. When
-  true, ITB resources are included too.
-- `TOPOLOGY_REFRESH`: default 15 min.
-- `TOPOLOGY_MAX_STALE`: default 24 h. When fetches fail, the last good copy
-  is used until it is this old; after that every decision fails until a fetch
-  succeeds. A document listing no active CE, or fewer than half the active
-  CEs of the copy in use, counts as a failed fetch and is logged as an
-  error; a restart accepts it.
-
-### Command line
-
-On a CE, `htc-registration request --approval` starts an approval request now,
-even when the CE is configured for callback, and prints the URL and code.
-
-On the registrar, `htc-registration approve CODE NAME` approves a request
-only if it is for `NAME` (compared without regard to case), so a code passed
-along with the wrong name is refused and the refusal shows the request's
-name. A name that already has an active registration is refused unless
-`--replace` is given, which also revokes the name's approval-mode
-registrations.
+Pushing a tag `vX.Y.Z` runs [release.yml](.github/workflows/release.yml),
+which builds the x86_64 and aarch64 RPMs, installs the x86_64 one in Rocky
+Linux 9 as a check, and attaches both with `SHA256SUMS` to the GitHub
+release for the tag. Every pull request builds and checks the RPMs the same
+way without publishing.
