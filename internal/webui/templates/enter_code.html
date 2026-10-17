@@ -5,6 +5,7 @@
 <p class="notice bad">{{.Error}}</p>
 {{- end}}
 <form method="get" action="/approve" class="code-entry">
+<input type="hidden" name="via" value="form">
 <label for="code">Code</label>
 <input id="code" name="code" value="{{.Code}}" placeholder="XXXX-XXXX" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="16" required autofocus>
 <button type="submit" class="primary">Continue</button>

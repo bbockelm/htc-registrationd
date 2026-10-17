@@ -1099,3 +1099,36 @@ func TestDiscoveryOutlivesTheBrowserThatStartedIt(t *testing.T) {
 		t.Errorf("discovery ran %d times", n)
 	}
 }
+
+func TestCodeFormAfterSessionEnds(t *testing.T) {
+	h := newHarness(t)
+	h.pending(testCE, "BCDF-GHJK")
+	c := h.browser()
+	h.login(c, "alice")
+	body, _ := h.get(c, "/approve")
+	if !strings.Contains(body, `name="via" value="form"`) {
+		t.Fatalf("the code form does not mark itself:\n%s", body)
+	}
+	h.clock.Advance(2 * time.Hour)
+	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+	// Submitted from the form: a page with a sign-in link, not a redirect
+	// that form-action 'self' would block on its way to the provider.
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/approve?code=BCDF-GHJK&via=form", nil)
+	rec := httptest.NewRecorder()
+	h.srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Header().Get("Location") != "" {
+		t.Fatalf("signed-out form submission: %d, Location %q", rec.Code, rec.Header().Get("Location"))
+	}
+	if !strings.Contains(rec.Body.String(), `<a href="/login?next=%2Fapprove%3Fcode%3DBCDF-GHJK">Sign in to continue</a>`) {
+		t.Errorf("no sign-in link:\n%s", rec.Body.String())
+	}
+	if csp := rec.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "form-action 'self';") {
+		t.Errorf("CSP %q", csp)
+	}
+
+	// Following a link (the CE's verification URI) still redirects.
+	if _, code := h.get(c, "/approve?code=BCDF-GHJK"); code != http.StatusSeeOther {
+		t.Errorf("signed-out link: %d", code)
+	}
+}

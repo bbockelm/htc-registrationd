@@ -134,14 +134,39 @@ func approver(sess *session) registrar.Identity {
 	return registrar.Identity{Kind: authz.IdentityKind, Principal: sess.Principal}
 }
 
-// requireLogin returns the session, or redirects to login (GET) or refuses
-// (POST) and returns nil.
+// codeFormMarker is a query parameter only the code form sends.
+const codeFormMarker = "via"
+
+// requireLogin returns the session, or sends the browser to sign in (GET)
+// or refuses (POST) and returns nil.
 func (s *Server) requireLogin(w http.ResponseWriter, r *http.Request) *session {
 	if ref := currentSession(r); ref != nil {
 		return ref.sess
 	}
 	if r.Method == http.MethodGet {
-		http.Redirect(w, r, "/login?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusSeeOther)
+		q := r.URL.Query()
+		fromForm := q.Get(codeFormMarker) == "form"
+		q.Del(codeFormMarker)
+		next := r.URL.Path
+		if len(q) > 0 {
+			next += "?" + q.Encode()
+		}
+		login := "/login?next=" + url.QueryEscape(next)
+		if fromForm {
+			// The code form was submitted after the session ended. The
+			// Content-Security-Policy's form-action 'self' also governs every
+			// redirect that follows a form submission, so redirecting it to
+			// the identity provider would be blocked. Ending here, at a link
+			// the user follows as a new navigation, keeps form-action at
+			// 'self'. Adding the provider's origin to form-action instead
+			// would still block any redirect the provider itself makes (to
+			// a home institution, say), and dropping form-action would let
+			// injected markup post a form anywhere.
+			s.render(w, http.StatusOK, "message", messagePage{base: s.base(r, "Signed out"), Heading: "Signed out",
+				Text: "Your session has ended.", LinkHref: login, LinkText: "Sign in to continue"})
+			return nil
+		}
+		http.Redirect(w, r, login, http.StatusSeeOther)
 		return nil
 	}
 	s.message(w, r, http.StatusForbidden, "Signed out", "Your session has ended. Sign in and try again.")
@@ -332,13 +357,6 @@ func (s *Server) lookupRequest(w http.ResponseWriter, r *http.Request, sess *ses
 		s.message(w, r, http.StatusConflict, "Request closed", "The request from "+rec.Name+" is "+rec.Status+".")
 	}
 	return nil
-}
-
-func utc(t time.Time) string {
-	if t.IsZero() {
-		return "an unknown time"
-	}
-	return t.UTC().Format("2006-01-02 15:04 UTC")
 }
 
 func (s *Server) handleApprovePage(w http.ResponseWriter, r *http.Request) {

@@ -1,9 +1,6 @@
 {{define "content"}}
 <h1>{{.Heading}}</h1>
 <p>{{.Text}}</p>
-{{- if .Detail}}
-<p class="muted">{{.Detail}}</p>
-{{- end}}
 {{- if .LinkHref}}
 <p><a href="{{.LinkHref}}">{{.LinkText}}</a></p>
 {{- end}}

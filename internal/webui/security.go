@@ -16,7 +16,9 @@ import (
 )
 
 // contentSecurityPolicy allows the page's own stylesheet and nothing else:
-// no script, no frames, forms posting only to this origin.
+// no script, no frames, forms submitting only to this origin (and, since
+// form-action also governs redirects, never redirected elsewhere: see
+// requireLogin).
 const contentSecurityPolicy = "default-src 'none'; style-src 'self'; img-src 'self'; " +
 	"form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
 
