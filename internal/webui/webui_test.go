@@ -915,6 +915,10 @@ func TestFromConfig(t *testing.T) {
 		"public HTTP":         with("HTC_REGISTRATIOND_HTTP_ADDR", "0.0.0.0:8080"),
 		"wildcard HTTP":       with("HTC_REGISTRATIOND_HTTP_ADDR", ":8080"),
 		"bad session timeout": with("HTC_REGISTRATIOND_SESSION_IDLE", "soon"),
+		"email principal":     with("HTC_REGISTRATIOND_OIDC_PRINCIPAL_CLAIM", "email"),
+		"Email principal":     with("HTC_REGISTRATIOND_OIDC_PRINCIPAL_CLAIM", "Email"),
+		// Even with the web UI off.
+		"email, no listener": {"HTC_REGISTRATIOND_OIDC_PRINCIPAL_CLAIM": "email"},
 	} {
 		if _, err := FromConfig(m); err == nil {
 			t.Errorf("%s: accepted", desc)

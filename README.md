@@ -178,8 +178,12 @@ used as identity.
 - `OIDC_PRINCIPAL_CLAIM`: default `sub`. Configuration (`ADMINS`, the
   mapfile) names a user by this claim's value. With `sub`, the registrar
   records a user as `<issuer>,<sub>`, and a recorded user matches
-  configuration only while `OIDC_ISSUER` is still that issuer. For OSG
-  Topology, set `osgid`.
+  configuration only while `OIDC_ISSUER` is still that issuer. Any other
+  claim is used as its bare value, with no issuer attached and no
+  verification check, so it must be an identifier that the configured
+  provider issues and never reassigns, such as `osgid`; for OSG Topology,
+  set `osgid`. It must never be `email`, and the daemon refuses to start
+  with `email`.
 - `ADMINS`: registrar administrators, a comma- or space-separated list of
   users by `OIDC_PRINCIPAL_CLAIM` value. They may approve any name, and see
   and revoke every registration. Re-read on reconfig.
@@ -213,7 +217,13 @@ OIDC /^ops-[0-9]+$/                                 ce2.example.edu
 ```
 
 A regular expression is written between slashes, so a `/` inside it is
-written `\/`. A name is literal or a `path.Match` glob (`*` also matches
+written `\/`. As in HTCondor, it is searched for anywhere in the user, not
+matched against the whole of it, so anchor it with `^` and `$`:
+`/ops-[0-9]+/` also matches `evil-ops-1-x`, while `/^ops-[0-9]+$/` matches
+only `ops-` and digits. `\1` through `\9` in the CE names are replaced by
+the regular expression's groups (`\0` by the whole match); a user whose
+substituted text holds a comma, `*`, `?`, `[` or `\` is allowed nothing
+by that line. A name is literal or a `path.Match` glob (`*` also matches
 dots); names compare without regard to case. As in any HTCondor map file, only the first
 line whose user matches is used, so list all of a user's names on
 that line. Only literal names are known for callback mode: a glob can approve

@@ -100,6 +100,13 @@ func FromConfig(cfg knobs.Getter) (*Config, error) {
 			PrincipalClaim: knobs.String(cfg, "HTC_REGISTRATIOND_OIDC_PRINCIPAL_CLAIM", "sub"),
 		},
 	}
+	// Configuration names users by this claim's bare value, with no issuer
+	// and no check that an address was verified, so it must be an
+	// identifier the provider never reassigns.
+	if strings.EqualFold(strings.TrimSpace(c.OIDC.PrincipalClaim), "email") {
+		return nil, errors.New("HTC_REGISTRATIOND_OIDC_PRINCIPAL_CLAIM must not be email: use sub, or an identifier " +
+			"the provider never reassigns, such as osgid")
+	}
 	var err error
 	if c.TrustedProxies, err = parseProxies(knobs.List(cfg, "HTC_REGISTRATIOND_TRUSTED_PROXIES", DefaultTrustedProxies)); err != nil {
 		return nil, err
