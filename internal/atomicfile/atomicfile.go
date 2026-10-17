@@ -18,6 +18,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/bbockelm/golang-htcondor/droppriv"
 )
 
 // hook, when non-nil, is called at named points of WriteFile. Tests use it to
@@ -34,7 +36,25 @@ func tempPattern(base string) string { return "." + base + ".tmp-*" }
 // succeeds: reporting it as a failure would leave the caller holding the old
 // state in memory while the file holds the new one. Only the rename's
 // durability across a power loss is in doubt.
-func WriteFile(path string, data []byte, perm fs.FileMode) (err error) {
+func WriteFile(path string, data []byte, perm fs.FileMode) error {
+	return writeFile(path, data, perm, false)
+}
+
+// WriteRootOwned is WriteFile for a file HTCondor reads as root, such as a
+// token in SEC_TOKEN_SYSTEM_DIRECTORY: when the process's real uid is root
+// (a daemon started by a root condor_master, running with a dropped
+// effective uid), the file is given to root:root before any data is written,
+// because HTCondor refuses such a file unless root owns it. The directory
+// must be writable by the effective uid. Run by any other user, it is
+// WriteFile.
+func WriteRootOwned(path string, data []byte, perm fs.FileMode) error {
+	return writeFile(path, data, perm, os.Getuid() == 0)
+}
+
+// chownRoot gives a file to root:root; replaceable by tests.
+var chownRoot = func(path string) error { return droppriv.ChownAsRoot(path, 0, 0) }
+
+func writeFile(path string, data []byte, perm fs.FileMode, rootOwned bool) (err error) {
 	dir, base := filepath.Split(path)
 	if dir == "" {
 		dir = "."
@@ -54,6 +74,11 @@ func WriteFile(path string, data []byte, perm fs.FileMode) (err error) {
 	// lands, so a secret is never briefly readable at a wider mode.
 	if err = tmp.Chmod(perm); err != nil {
 		return fmt.Errorf("atomicfile: chmod %s: %w", tmpName, err)
+	}
+	if rootOwned {
+		if err = chownRoot(tmpName); err != nil {
+			return fmt.Errorf("atomicfile: giving %s to root: %w", tmpName, err)
+		}
 	}
 	if _, err = tmp.Write(data); err != nil {
 		return fmt.Errorf("atomicfile: writing %s: %w", tmpName, err)

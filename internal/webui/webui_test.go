@@ -873,11 +873,11 @@ func TestClientIPTrustedProxies(t *testing.T) {
 	if _, err := parseProxies([]string{"proxy.example.org"}); err == nil {
 		t.Error("a host name was accepted as a proxy")
 	}
-	c, err := FromConfig(knobs.Map{"HTC_REGISTRATIOND_TRUSTED_PROXIES": "192.0.2.5, 2001:db8::/32"})
+	c, err := FromConfig(knobs.Map{"HTC_REGISTRATIOND_TRUSTED_PROXIES": "192.0.2.5, 2001:db8::/32"}, false)
 	if err != nil || len(c.TrustedProxies) != 2 || !trustedProxy(netip.MustParseAddr("2001:db8::7"), c.TrustedProxies) {
 		t.Errorf("TRUSTED_PROXIES: %v, %v", c, err)
 	}
-	if _, err := FromConfig(knobs.Map{"HTC_REGISTRATIOND_TRUSTED_PROXIES": "nope"}); err == nil {
+	if _, err := FromConfig(knobs.Map{"HTC_REGISTRATIOND_TRUSTED_PROXIES": "nope"}, false); err == nil {
 		t.Error("a bad TRUSTED_PROXIES was accepted")
 	}
 }
@@ -892,11 +892,11 @@ func TestFromConfig(t *testing.T) {
 		"HTC_REGISTRATIOND_OIDC_CLIENT_ID": "cid",
 		"HTC_REGISTRATIOND_OIDC_SCOPES":    "openid email profile org.cilogon.userinfo",
 	}
-	c, err := FromConfig(ok)
+	c, err := FromConfig(ok, false)
 	if err != nil || !c.Enabled() || c.VerificationURI() != "https://registrar.example.org/approve" || len(c.OIDC.Scopes) != 4 {
 		t.Fatalf("%+v, %v", c, err)
 	}
-	if c, err := FromConfig(knobs.Map{}); err != nil || c.Enabled() {
+	if c, err := FromConfig(knobs.Map{}, false); err != nil || c.Enabled() {
 		t.Fatalf("no listener: %+v, %v", c, err)
 	}
 	with := func(k, v string) knobs.Map {
@@ -923,15 +923,15 @@ func TestFromConfig(t *testing.T) {
 		// Even with the web UI off.
 		"email, no listener": {"HTC_REGISTRATIOND_OIDC_PRINCIPAL_CLAIM": "email"},
 	} {
-		if _, err := FromConfig(m); err == nil {
+		if _, err := FromConfig(m, false); err == nil {
 			t.Errorf("%s: accepted", desc)
 		}
 	}
-	if c, err := FromConfig(with("HTC_REGISTRATIOND_PUBLIC_URL", "HTTPS://Registrar.Example.org:443")); err != nil ||
+	if c, err := FromConfig(with("HTC_REGISTRATIOND_PUBLIC_URL", "HTTPS://Registrar.Example.org:443"), false); err != nil ||
 		c.VerificationURI() != "https://registrar.example.org/approve" {
 		t.Errorf("non-canonical public URL: %v", err)
 	}
-	if _, err := FromConfig(with("HTC_REGISTRATIOND_HTTP_ADDR", "127.0.0.1:8080")); err != nil {
+	if _, err := FromConfig(with("HTC_REGISTRATIOND_HTTP_ADDR", "127.0.0.1:8080"), false); err != nil {
 		t.Errorf("loopback HTTP: %v", err)
 	}
 	if _, err := FromConfig(knobs.Map{
@@ -939,8 +939,30 @@ func TestFromConfig(t *testing.T) {
 		"HTC_REGISTRATIOND_PUBLIC_URL":     "http://localhost:8080",
 		"HTC_REGISTRATIOND_OIDC_ISSUER":    "https://cilogon.org",
 		"HTC_REGISTRATIOND_OIDC_CLIENT_ID": "cid",
-	}); err != nil {
+	}, false); err != nil {
 		t.Errorf("loopback-only setup: %v", err)
+	}
+
+	// The shared port: forwarded HTTPS on the shared port's host:port, with
+	// no listener of its own.
+	sp := with("HTC_REGISTRATIOND_HTTPS_ADDR", "")
+	sp["HTC_REGISTRATIOND_PUBLIC_URL"] = "https://Collector.Example.org:9619"
+	if c, err := FromConfig(sp, true); err != nil || !c.Enabled() || !c.SharedPort ||
+		c.VerificationURI() != "https://collector.example.org:9619/approve" {
+		t.Errorf("shared port: %+v, %v", c, err)
+	}
+	if c, err := FromConfig(sp, false); err != nil || c.Enabled() {
+		t.Errorf("shared port not forwarded here: %+v, %v", c, err)
+	}
+	noURL := with("HTC_REGISTRATIOND_HTTPS_ADDR", "")
+	noURL["HTC_REGISTRATIOND_PUBLIC_URL"] = ""
+	if c, err := FromConfig(noURL, true); err != nil || c.Enabled() {
+		t.Errorf("shared port without a public URL: %+v, %v", c, err)
+	}
+	spNoKey := with("HTC_REGISTRATIOND_HTTPS_ADDR", "")
+	spNoKey["HTC_REGISTRATIOND_HTTPS_KEYFILE"] = ""
+	if _, err := FromConfig(spNoKey, true); err == nil {
+		t.Error("shared port without a key: accepted")
 	}
 }
 

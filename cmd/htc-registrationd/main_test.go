@@ -7,7 +7,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bbockelm/cedar/security"
+
+	"github.com/bbockelm/htc-registrationd/internal/cedarx"
 	"github.com/bbockelm/htc-registrationd/internal/knobs"
+	"github.com/bbockelm/htc-registrationd/internal/testpki"
 )
 
 // SEC_TOKEN_DIRECTORY, when set, wins over SEC_TOKEN_SYSTEM_DIRECTORY, as in
@@ -130,5 +134,25 @@ func TestUseCEConfig(t *testing.T) {
 	useCEConfig()
 	if got := os.Getenv("CONDOR_CONFIG"); got != ceConfig {
 		t.Errorf("CONDOR_CONFIG = %q, want %q", got, ceConfig)
+	}
+}
+
+// HTCondor-CE's default method list is FS alone; REG_CALLBACK is served with
+// SSL anyway, so a loadable server certificate is what makes callback mode
+// available. The candidate list is walked as HTCondor walks it.
+func TestSSLServerAvailable(t *testing.T) {
+	ca := testpki.NewCA(t)
+	cert, key := ca.ServerCert(t, "ce.example.org")
+	sc := &security.SecurityConfig{AuthMethods: []security.AuthMethod{security.AuthFS}}
+	cedarx.SSLServerCredential(knobs.Map{
+		"AUTH_SSL_SERVER_CERTFILE": "/nonexistent/localhost.crt," + cert,
+		"AUTH_SSL_SERVER_KEYFILE":  "/nonexistent/localhost.key," + key,
+	}, sc)
+	if ok, why := sslServerAvailable(sc); !ok {
+		t.Fatalf("FS-only method list, loadable certificate: unavailable (%s)", why)
+	}
+	sc.CertFile, sc.KeyFile = "/nonexistent/localhost.crt", "/nonexistent/localhost.key"
+	if ok, _ := sslServerAvailable(sc); ok {
+		t.Fatal("no readable certificate: available")
 	}
 }

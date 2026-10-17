@@ -49,14 +49,19 @@ func TestServerSSLTrust(t *testing.T) {
 	}
 	HardenCommands(srv, 2)
 	var cur atomic.Pointer[knobs.Map]
-	cur.Store(&knobs.Map{"AUTH_SSL_SERVER_CAFILE": "/server.pem"})
+	// HTCondor-CE's defaults: a candidate list, and FS as the only method.
+	cur.Store(&knobs.Map{"AUTH_SSL_SERVER_CAFILE": "/server.pem",
+		"AUTH_SSL_SERVER_CERTFILE": "/etc/pki/tls/certs/localhost.crt,/etc/grid-security/hostcert.pem",
+		"AUTH_SSL_SERVER_KEYFILE":  "/etc/pki/tls/private/localhost.key,/etc/grid-security/hostkey.pem"})
 	ServerSSLTrust(func() knobs.Getter { return *cur.Load() }, srv)
 	if srv.SecurityConfig.CAFile != "/server.pem" {
 		t.Fatalf("base CAFile %q", srv.SecurityConfig.CAFile)
 	}
 	for _, cmd := range []int{1, 2, 3} {
 		sc := srv.SecurityConfigForCommand(cmd)
-		if sc == nil || sc.CAFile != "/server.pem" || sc.UseDefaultCAs == nil || !*sc.UseDefaultCAs {
+		if sc == nil || sc.CAFile != "/server.pem" || sc.UseDefaultCAs == nil || !*sc.UseDefaultCAs ||
+			sc.CertFile != "/etc/pki/tls/certs/localhost.crt,/etc/grid-security/hostcert.pem" ||
+			sc.KeyFile != "/etc/pki/tls/private/localhost.key,/etc/grid-security/hostkey.pem" {
 			t.Fatalf("command %d: %+v", cmd, sc)
 		}
 	}

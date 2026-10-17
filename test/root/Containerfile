@@ -1,0 +1,10 @@
+# An HTCondor-CE host from the HTCondor 25.x (feature) repository:
+# PACKAGES is "htcondor-ce-collector" for the CE-Collector that runs the
+# registrar, "htcondor-ce" for a CE.
+FROM almalinux:9
+ARG PACKAGES
+ARG CHANNEL=25.x
+RUN dnf -y install epel-release \
+ && dnf -y install https://research.cs.wisc.edu/htcondor/repo/${CHANNEL}/htcondor-release-current.el9.noarch.rpm \
+ && dnf -y install condor ${PACKAGES} openssl procps-ng iproute \
+ && dnf clean all

@@ -4,7 +4,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/bbockelm/golang-htcondor/droppriv"
 )
 
 func TestWriteFileReplacesAndSetsMode(t *testing.T) {
@@ -126,6 +129,37 @@ func TestRemoveTemps(t *testing.T) {
 	for _, n := range gone {
 		if _, err := os.Stat(filepath.Join(dir, n)); !errors.Is(err, os.ErrNotExist) {
 			t.Errorf("%s was kept", n)
+		}
+	}
+}
+
+// WriteRootOwned gives the file to root before writing it when the real uid
+// is root, and is WriteFile otherwise.
+func TestWriteRootOwned(t *testing.T) {
+	var chowned []string
+	chownRoot = func(p string) error { chowned = append(chowned, p); return nil }
+	t.Cleanup(func() { chownRoot = func(p string) error { return droppriv.ChownAsRoot(p, 0, 0) } })
+	path := filepath.Join(t.TempDir(), "50-token")
+	if err := WriteRootOwned(path, []byte("tok\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := os.ReadFile(path); err != nil || string(b) != "tok\n" { //nolint:gosec // test file
+		t.Fatalf("%q %v", b, err)
+	}
+	if os.Getuid() == 0 {
+		if len(chowned) != 1 || !strings.Contains(filepath.Base(chowned[0]), ".50-token.tmp-") {
+			t.Fatalf("chowned %v, want the temporary file", chowned)
+		}
+	} else if len(chowned) != 0 {
+		t.Fatalf("chowned %v as uid %d", chowned, os.Getuid())
+	}
+	chownRoot = func(string) error { return errors.New("no") }
+	if os.Getuid() == 0 {
+		if err := WriteRootOwned(path, []byte("new\n"), 0o600); err == nil {
+			t.Fatal("a failed chown was ignored")
+		}
+		if b, _ := os.ReadFile(path); string(b) != "tok\n" { //nolint:gosec // test file
+			t.Fatalf("a failed chown replaced the file: %q", b)
 		}
 	}
 }

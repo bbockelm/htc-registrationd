@@ -48,9 +48,13 @@ type Options struct {
 
 // Demo is a running demo.
 type Demo struct {
-	opts         Options
-	root         string
-	user         string
+	opts Options
+	root string
+	user string
+	// daemonUser is who the daemons authenticate as by FS: the user, or,
+	// when the demo runs as root, the condor account HTCondor's FS
+	// authentication uses for a root daemon.
+	daemonUser   string
 	pki          *pki
 	ports        *ports
 	clientSecret string
@@ -91,12 +95,25 @@ func New(opts Options) (*Demo, error) {
 	if err != nil {
 		return nil, err
 	}
-	d := &Demo{opts: opts, root: root, user: u.Username, out: &output{w: opts.Out, width: 9}}
+	d := &Demo{opts: opts, root: root, user: u.Username, daemonUser: u.Username, out: &output{w: opts.Out, width: 9}}
+	if os.Geteuid() == 0 {
+		if _, err := user.Lookup("condor"); err == nil {
+			d.daemonUser = "condor"
+		}
+	}
 	d.ces = []*CE{
 		{Key: "ce1", Name: "ce1.localhost", Method: ce.MethodCallback, dir: filepath.Join(root, "ce1")},
 		{Key: "ce2", Name: "ce2.localhost", Method: ce.MethodApproval, dir: filepath.Join(root, "ce2")},
 	}
 	return d, nil
+}
+
+// allowUsers is the ALLOW_* value naming the user and the daemons.
+func (d *Demo) allowUsers() string {
+	if d.daemonUser == d.user {
+		return d.user + "@*"
+	}
+	return d.user + "@*, " + d.daemonUser + "@*"
 }
 
 // Root is the demo's state directory.

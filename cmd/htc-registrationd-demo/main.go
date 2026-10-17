@@ -28,6 +28,8 @@ Commands:
   cli DAEMON ARGS...       run htc-registration against registrar, ce1 or ce2
   advertise CE NAME        advertise a Scheduler ad named NAME to the demo
                            collector with CE's (ce1, ce2) installed token
+  idp FLAGS...             serve only the identity provider, over HTTPS
+                           (idp -h lists its flags)
 
 Flags:
 `
@@ -45,6 +47,9 @@ func main() {
 		fs.PrintDefaults()
 	}
 	_ = fs.Parse(os.Args[1:])
+	if fs.Arg(0) == "idp" {
+		os.Exit(runIDP(fs.Args()[1:]))
+	}
 	// cedar logs each handshake step at INFO through the default logger.
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	d, err := demo.New(demo.Options{Dir: *dir, Daemon: *daemon, CondorBin: *condorBin, NoCollector: *noCollector,

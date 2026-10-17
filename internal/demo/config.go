@@ -41,6 +41,14 @@ func (d *Demo) commonConfig(b *strings.Builder, dir, host string) {
 	w("ENABLE_IPV6", "false")
 	w("NETWORK_INTERFACE", "127.0.0.1")
 	w("USE_SHARED_PORT", "false")
+	if os.Geteuid() == 0 {
+		// Every file here belongs to the user running the demo. Started as
+		// root, a daemon would drop to the condor account and lose access
+		// to them; under a real master its directories belong to condor and
+		// its credentials to root (the root integration test covers that).
+		b.WriteString("# The demo runs as root: its daemons keep running as root.\n")
+		w("DROP_PRIVILEGES", "false")
+	}
 	b.WriteString("\n# Local tools authenticate by file system; daemons prove their names by SSL.\n")
 	w("SEC_DEFAULT_AUTHENTICATION_METHODS", "FS, SSL, IDTOKENS")
 	w("AUTH_SSL_CLIENT_CAFILE", d.pki.caFile)
@@ -51,9 +59,9 @@ func (d *Demo) commonConfig(b *strings.Builder, dir, host string) {
 	w("SEC_TOKEN_SYSTEM_DIRECTORY", "$(LOCAL_DIR)/tokens.d")
 	w("SEC_TOKEN_DIRECTORY", "$(LOCAL_DIR)/tokens.d")
 	w("ALLOW_READ", "*")
-	w("ALLOW_WRITE", d.user+"@*")
-	w("ALLOW_DAEMON", d.user+"@*")
-	w("ALLOW_ADMINISTRATOR", d.user+"@*")
+	w("ALLOW_WRITE", d.allowUsers())
+	w("ALLOW_DAEMON", d.allowUsers())
+	w("ALLOW_ADMINISTRATOR", d.allowUsers())
 	b.WriteString("\n")
 	w("HTC_REGISTRATIOND_LOG", "$(LOG)/"+daemonLogName)
 	w("HTC_REGISTRATIOND_DEBUG", "general:info")
