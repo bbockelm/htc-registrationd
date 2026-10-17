@@ -69,7 +69,7 @@ func run() error {
 	listen := flag.String("listen", ":0", "fallback TCP listen address when not inheriting a shared-port endpoint")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	localName := flag.String("local-name", "", "HTCondor local-name; passed by condor_master")
-	_ = flag.String("sock", "", "shared-port endpoint name; accepted for compatibility (fd inherited via CONDOR_INHERIT)")
+	sock := flag.String("sock", "", "shared-port endpoint name; condor_master names the endpoint it hands this daemon after it")
 	flag.Parse()
 	if *showVersion {
 		fmt.Println("htc-registrationd", version)
@@ -143,6 +143,10 @@ func run() error {
 	})
 	d.RegisterDefaultCommands(srv)
 
+	if err := cedarx.SSLTrust(cfg, "CLIENT", &security.SecurityConfig{}); err != nil {
+		return err
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -162,6 +166,13 @@ func run() error {
 	// negotiates SSL-only with encryption required, layered over the
 	// per-level policy installed above.
 	cedarx.HardenCommands(srv, protocol.EncryptedCommands...)
+	if err := cedarx.ServerSSLTrust(cfg, srv); err != nil {
+		return err
+	}
+	if *sock != "" && d.SharedPortName() != *sock {
+		log.Warn("not listening on the shared-port endpoint named by -sock; is HTC_REGISTRATIOND in DC_DAEMON_LIST?",
+			"sock", *sock, "endpoint", d.SharedPortName())
+	}
 
 	if path := writeAddressFile(d, cfg, ln); path != "" {
 		defer func() { _ = os.Remove(path) }()
@@ -216,15 +227,15 @@ func trustDomain(cfg *config.Config) string {
 }
 
 // clientSecurity is the base client security config for outbound SSL
-// connections: the pool's CLIENT policy, with the CA file named by
-// caKnob or else AUTH_SSL_CLIENT_CAFILE (empty: system roots).
-func clientSecurity(cfg *config.Config, cmd int, caKnob string) func() *security.SecurityConfig {
+// connections: the pool's CLIENT policy, trusting what the AUTH_SSL_CLIENT_*
+// CA knobs name (run validates them at startup).
+func clientSecurity(cfg *config.Config, cmd int) func() *security.SecurityConfig {
 	return func() *security.SecurityConfig {
 		sc, err := htcondor.GetSecurityConfig(cfg, cmd, "CLIENT")
 		if err != nil || sc == nil {
 			sc = &security.SecurityConfig{}
 		}
-		sc.CAFile = knobs.String(cfg, caKnob, knobs.String(cfg, "AUTH_SSL_CLIENT_CAFILE", ""))
+		_ = cedarx.SSLTrust(cfg, "CLIENT", sc)
 		return sc
 	}
 }
@@ -321,7 +332,7 @@ func setupRegistrar(ctx context.Context, d *daemon.Daemon, cfg *config.Config, s
 		Approvers:              registrar.TrustCEDARApprovers{},
 		RecheckApprover:        recheck,
 		MaxRegistrationAge:     maxAge,
-		CallbackSecurity:       clientSecurity(cfg, protocol.RegCallback, "HTC_REGISTRATIOND_CALLBACK_CAFILE"),
+		CallbackSecurity:       clientSecurity(cfg, protocol.RegCallback),
 		CallbackConnectTimeout: connectTO,
 		CallbackTimeout:        callbackTO,
 		MaxPendingPerIP:        perIP,
@@ -421,7 +432,7 @@ func setupCE(ctx context.Context, d *daemon.Daemon, cfg *config.Config, srv *ced
 	mgr, err := ce.NewManager(ce.Config{
 		Name:                name,
 		Method:              strings.ToLower(knobs.String(cfg, "HTC_REGISTRATIOND_METHOD", ce.MethodAuto)),
-		Registrar:           knobs.String(cfg, "HTC_REGISTRATIOND_REGISTRAR", ""),
+		Registrar:           knobs.String(cfg, "HTC_REGISTRATIOND_REGISTRAR", knobs.DefaultRegistrar(cfg)),
 		RegistrarServerName: knobs.String(cfg, "HTC_REGISTRATIOND_REGISTRAR_NAME", ""),
 		StateDir:            dir,
 		TokenFile:           tokenFile,
@@ -437,7 +448,7 @@ func setupCE(ctx context.Context, d *daemon.Daemon, cfg *config.Config, srv *ced
 			return "", fmt.Errorf("no advertised address (not behind shared port); set HTC_REGISTRATIOND_CALLBACK_ADDRESS")
 		},
 		SSLServerAvailable: func() (bool, string) { return sslServerAvailable(serverSC) },
-		ClientSecurity:     clientSecurity(cfg, protocol.RegRequest, "HTC_REGISTRATIOND_REGISTRAR_CAFILE"),
+		ClientSecurity:     clientSecurity(cfg, protocol.RegRequest),
 		Reconfig:           func(ctx context.Context) error { return reconfigMaster(ctx, d, cfg) },
 		Ping:               pingViewHost(cfg),
 		Logger:             log,

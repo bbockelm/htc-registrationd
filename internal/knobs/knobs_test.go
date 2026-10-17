@@ -55,3 +55,32 @@ func TestSpoolWarning(t *testing.T) {
 		t.Errorf("outside SPOOL but warned: %q", w)
 	}
 }
+
+func TestDefaultRegistrar(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  Map
+		want string
+	}{
+		{"unset", Map{}, ""},
+		{"host and port", Map{"CONDOR_VIEW_HOST": "collector.example.org:9619"},
+			"<collector.example.org:9619?sock=htc_registrationd>"},
+		{"first of several", Map{"CONDOR_VIEW_HOST": "c1.example.org:9619, c2.example.org:9619"},
+			"<c1.example.org:9619?sock=htc_registrationd>"},
+		{"space separated", Map{"CONDOR_VIEW_HOST": "c1.example.org:9619 c2.example.org:9619"},
+			"<c1.example.org:9619?sock=htc_registrationd>"},
+		{"no port takes COLLECTOR_PORT", Map{"CONDOR_VIEW_HOST": "collector.example.org", "COLLECTOR_PORT": "9619"},
+			"<collector.example.org:9619?sock=htc_registrationd>"},
+		{"no port and no COLLECTOR_PORT", Map{"CONDOR_VIEW_HOST": "collector.example.org"},
+			"<collector.example.org:9618?sock=htc_registrationd>"},
+		{"sinful with another sock", Map{"CONDOR_VIEW_HOST": "<192.0.2.5:9619?sock=collector&addrs=192.0.2.5-9619>"},
+			"<192.0.2.5:9619?sock=htc_registrationd>"},
+		{"ipv6", Map{"CONDOR_VIEW_HOST": "[2001:db8::5]:9619"},
+			"<[2001:db8::5]:9619?sock=htc_registrationd>"},
+	}
+	for _, tc := range cases {
+		if got := DefaultRegistrar(tc.cfg); got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}

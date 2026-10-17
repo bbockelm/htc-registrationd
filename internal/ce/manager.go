@@ -147,7 +147,7 @@ func NewManager(cfg Config) (*Manager, error) {
 		return nil, errors.New("no name to register (set HTC_REGISTRATIOND_NAME)")
 	}
 	if cfg.Registrar == "" {
-		return nil, errors.New("no registrar address (set HTC_REGISTRATIOND_REGISTRAR)")
+		return nil, errors.New("no registrar address (set HTC_REGISTRATIOND_REGISTRAR or CONDOR_VIEW_HOST)")
 	}
 	if cfg.StateDir == "" || cfg.TokenFile == "" {
 		return nil, errors.New("StateDir and TokenFile are required")
