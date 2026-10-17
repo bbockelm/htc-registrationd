@@ -106,7 +106,6 @@ func serverSecurity(certFile, keyFile, keyDir string) *security.SecurityConfig {
 
 func newPair(t *testing.T, opts pairOptions) *pair {
 	t.Helper()
-	requireGoSSL(t)
 	if opts.method == "" {
 		opts.method = MethodCallback
 	}

@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/PelicanPlatform/classad v0.31.5
-	github.com/bbockelm/cedar v0.7.11-0.20261017131232-0ecdcb58355f
+	github.com/bbockelm/cedar v0.7.11
 	github.com/bbockelm/golang-htcondor v0.20.3-0.20261017130920-6169867573e4
 	github.com/glebarez/go-sqlite v1.23.0
 	golang.org/x/crypto v0.55.0

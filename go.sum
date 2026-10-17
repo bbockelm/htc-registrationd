@@ -1,7 +1,7 @@
 github.com/PelicanPlatform/classad v0.31.5 h1:bOFK980T4jE7+9EcpaoklcP0NgmgDY2M4+Hdloh7FAw=
 github.com/PelicanPlatform/classad v0.31.5/go.mod h1:PEBQZp1N+KqUcAPMWhHqdCq+P5OSEYT2V14SeiXVM04=
-github.com/bbockelm/cedar v0.7.11-0.20261017131232-0ecdcb58355f h1:OARML36jp/zhw5OV5HEyARgjryYRdLkp7rHtjFe1Gz4=
-github.com/bbockelm/cedar v0.7.11-0.20261017131232-0ecdcb58355f/go.mod h1:1SABFonyJbC729ODTx03voZhpMSBQqqy+Q+6TvpE08s=
+github.com/bbockelm/cedar v0.7.11 h1:Z632oDRrUwcv8LOWvngJfR0kZHEYOFxZBjhVpy36fT8=
+github.com/bbockelm/cedar v0.7.11/go.mod h1:1SABFonyJbC729ODTx03voZhpMSBQqqy+Q+6TvpE08s=
 github.com/bbockelm/golang-htcondor v0.20.3-0.20261017130920-6169867573e4 h1:cZ7n+lYgPa2L1mkH0kcoYEDDcGt1ygL91FmlvdoCQH0=
 github.com/bbockelm/golang-htcondor v0.20.3-0.20261017130920-6169867573e4/go.mod h1:u53dUPlghP6x67ZbPSweJB0v7nOdSeqeBfyXeaee6k8=
 github.com/bbockelm/gosssd v0.0.4 h1:VfPc8eqINew99vwq3+si4FC+tpcauXrSntGmaii4zqY=

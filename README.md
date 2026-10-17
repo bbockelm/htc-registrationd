@@ -59,10 +59,7 @@ configurations set `HTC_REGISTRATIOND_ARGS = -sock htc_registrationd`, so the
 registrar is always at `<collector-host:port?sock=htc_registrationd>`.
 
 The end-to-end tests in `internal/ce` run a registrar and a CE as two cedar
-servers on loopback, using a generated test CA. They need a cedar that can
-complete a Go-to-Go SSL handshake. When the linked cedar cannot, they skip
-with a message that names the failure. Set
-`HTC_REGISTRATIOND_REQUIRE_GO_SSL=1` to make them fail instead.
+servers on loopback, using a generated test CA.
 
 ## Command numbers
 
