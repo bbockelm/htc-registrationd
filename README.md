@@ -14,7 +14,9 @@ called the registrar. A CE proves its name in one of two ways:
 - **Callback mode.** The CE has a host certificate that names it. The
   registrar connects back to the CE and checks that certificate. Nobody has
   to approve anything.
-- **Approval mode.** The CE has no usable host certificate. The CE shows a
+- **Approval mode.** The CE-Collector cannot connect back to the CE: it is
+  behind a firewall or NAT, has no public DNS name, or has no certificate
+  that names it. The CE shows a
   URL and a code, and an administrator approves the request in the
   registrar's web page after signing in. Who may approve which CE comes from
   a map file or from OSG Topology. After the first approval, the CE renews
@@ -142,14 +144,19 @@ For callback mode:
   private, loopback or link-local addresses unless its administrator allows
   them.
 
-### A CE without a host certificate (approval mode)
+### A CE the CE-Collector cannot reach (approval mode)
 
 ```
 HTC_REGISTRATIOND_METHOD = approval
 ```
 
-The CE needs only to reach the CE-Collector on port 9619, as it already
-does to advertise.
+Use approval mode when the CE is behind a firewall or NAT, has no public DNS
+name, or has no certificate that names it. The CE needs only to reach the
+CE-Collector on port 9619, as it already does to advertise.
+
+The CE is registered under the name its schedd advertises (see below). On a
+CE without a public DNS name, check that this name is the one the approver
+expects and is allowed to approve.
 
 ### Start it
 
