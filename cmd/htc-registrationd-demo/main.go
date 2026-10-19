@@ -30,6 +30,9 @@ Commands:
                            collector with CE's (ce1, ce2) installed token
   idp FLAGS...             serve only the identity provider, over HTTPS
                            (idp -h lists its flags)
+  scitoken-issuer FLAGS... serve only a SciToken issuer, over HTTPS, that
+                           mints a token for any subject on POST /mint
+                           (scitoken-issuer -h lists its flags)
 
 Flags:
 `
@@ -47,8 +50,11 @@ func main() {
 		fs.PrintDefaults()
 	}
 	_ = fs.Parse(os.Args[1:])
-	if fs.Arg(0) == "idp" {
+	switch fs.Arg(0) {
+	case "idp":
 		os.Exit(runIDP(fs.Args()[1:]))
+	case "scitoken-issuer":
+		os.Exit(runIssuer(fs.Args()[1:]))
 	}
 	// cedar logs each handshake step at INFO through the default logger.
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})))

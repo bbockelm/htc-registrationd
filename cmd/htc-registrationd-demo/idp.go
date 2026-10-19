@@ -39,10 +39,6 @@ func runIDP(args []string) int {
 	if err != nil {
 		fatal(err)
 	}
-	pair, err := tls.LoadX509KeyPair(*cert, *key)
-	if err != nil {
-		fatal(err)
-	}
 	var users []idp.User
 	for _, u := range demo.Users {
 		users = append(users, idp.User{Sub: u.Sub})
@@ -52,14 +48,23 @@ func runIDP(args []string) int {
 		RedirectURI: *redirect, Users: users, EmailDomain: "example.org",
 		Logger: slog.New(slog.NewTextHandler(os.Stderr, nil)),
 	})
+	return serveHTTPS(*listen, *cert, *key, p.Handler(), "identity provider "+*issuer)
+}
+
+// serveHTTPS serves h over HTTPS on listen until SIGINT or SIGTERM.
+func serveHTTPS(listen, certFile, keyFile string, h http.Handler, what string) int {
+	pair, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		fatal(err)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", *listen)
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", listen)
 	if err != nil {
 		fatal(err)
 	}
 	srv := &http.Server{
-		Handler:           p.Handler(),
+		Handler:           h,
 		ReadHeaderTimeout: 10 * time.Second,
 		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{pair}},
 	}
@@ -69,7 +74,7 @@ func runIDP(args []string) int {
 		defer cancel()
 		_ = srv.Shutdown(sctx)
 	}()
-	fmt.Fprintf(os.Stderr, "identity provider %s on %s\n", *issuer, ln.Addr())
+	fmt.Fprintf(os.Stderr, "%s on %s\n", what, ln.Addr())
 	if err := srv.ServeTLS(ln, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fatal(err)
 	}
